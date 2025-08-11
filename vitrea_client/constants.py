@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Dict
 
-DOMAIN = "vitrea"
+DOMAIN = "vitrea_client"
 
 MONITOR = 'VITREA_MONITOR'
 SWITCHES = 'VITREA_SWITCHES'

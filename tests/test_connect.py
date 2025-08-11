@@ -3,14 +3,14 @@ import logging
 
 import pytest
 
-from vitrea.client import VitreaClient
+from vitrea_client.client import VitreaClient
 
 logging.basicConfig(level=logging.DEBUG)
 
 @pytest.mark.asyncio
 async def test_connect():
-    from vitrea.constants import VitreaEvents
-    client = VitreaClient(host='192.168.1.136', port=11502)
+    from vitrea_client.constants import VitreaEvents
+    client = VitreaClient(host='192.168.1.123', port=11502)
 
     await client.connect()
 

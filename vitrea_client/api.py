@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import threading
 from collections import defaultdict
 
-from vitrea.constants import DeviceStatus, ErrorCode, ERROR_MESSAGES, VitreaCommand, VitreaResponse, VitreaEvents
+from vitrea_client.constants import DeviceStatus, ErrorCode, ERROR_MESSAGES, VitreaCommand, VitreaResponse, VitreaEvents
 
 # debug mode
 import logging

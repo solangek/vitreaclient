@@ -17,15 +17,17 @@ from vitrea_client.client import VitreaClient
 from vitrea_client.constants import VitreaEvents
 import asyncio
 
-async def vitrea_test():
 
+async def vitrea_test():
     client = VitreaClient(host='1.2.3.4', port=12345)
 
     await client.connect()
 
     status_events = []
+
     def on_status(event):
-        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
+        print(
+            f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
         status_events.append(event)
 
     print(f"Registering listener for event: {VitreaEvents.RESPONSE_STATUS}")

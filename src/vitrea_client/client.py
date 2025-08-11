@@ -1,9 +1,9 @@
 """Vitrea API client implementation."""
-from vitrea_client.api import *
+from src.vitrea_client.api import *
 import asyncio
 from typing import Optional, Dict, Callable, List
 
-from vitrea_client.constants import DeviceStatus, ErrorCode, ERROR_MESSAGES, VitreaCommand, VitreaResponse, VitreaEvents
+from src.vitrea_client.constants import VitreaCommand, VitreaResponse, VitreaEvents
 
 
 # debug mode

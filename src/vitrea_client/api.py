@@ -2,12 +2,12 @@
 
 import asyncio
 import socket
-from typing import Optional, Dict, Callable, List, Union
+from typing import Optional, Union
 from dataclasses import dataclass
 import threading
 from collections import defaultdict
 
-from vitrea_client.constants import DeviceStatus, ErrorCode, ERROR_MESSAGES, VitreaCommand, VitreaResponse, VitreaEvents
+from src.vitrea_client.constants import VitreaResponse
 
 # debug mode
 import logging

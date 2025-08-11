@@ -7,14 +7,14 @@ Note that the port is not necessarily the port used by the Vitrea app (hint: try
 ## Installation
 
 ```bash
-pip install vitrea_client
+pip install vitreaclient
 ```
 
 ## Usage
 
 ```python
-from vitrea_client.client import VitreaClient
-from vitrea_client.constants import VitreaEvents
+from vitreaclient.client import VitreaClient
+from vitreaclient.constants import VitreaEvents
 import asyncio
 
 

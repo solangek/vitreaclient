@@ -4,6 +4,6 @@
 
 
 # expose VitreaMonitor
-from src.vitrea_client.client import VitreaClient
+from src.vitreaclient.client import VitreaClient
 # expose all constants
-from src.vitrea_client.constants import *
+from src.vitreaclient.constants import *

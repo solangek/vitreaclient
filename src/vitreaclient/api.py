@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import threading
 from collections import defaultdict
 
-from src.vitrea_client.constants import VitreaResponse
+from src.vitreaclient.constants import VitreaResponse
 
 # debug mode
 import logging

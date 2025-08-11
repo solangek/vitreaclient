@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vitrea_client"
-version = "0.1.0"
+name = "vitreaclient"
+version = "0.1.1"
 description = "Python package encapsulating Vitrea box communication protocol."
 authors = [
     { name = "SK", email = "skappdevel@gmail.com" }
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/solangek/vitrea_client"
+Homepage = "https://github.com/solangek/vitreaclient"
 
 [tool.setuptools.packages.find]
 where = ["src"]

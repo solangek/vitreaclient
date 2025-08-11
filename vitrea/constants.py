@@ -86,4 +86,4 @@ class VitreaEvents(Enum):
     NODE_JOINED = "node_joined"
     NODE_LEFT = "node_left"
     OK = "ok"
-    # Add more events as needed
+

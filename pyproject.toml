@@ -7,12 +7,12 @@ name = "vitrea"
 version = "0.1.0"
 description = "Python package encapsulating Vitrea box communication protocol."
 authors = [
-    { name = "SK developper", email = "skappdevel@gmail.com" }
+    { name = "SK", email = "skappdevel@gmail.com" }
 ]
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
-keywords = ["home automation", "vitrea", "home assistant"]
+keywords = ["home automation", "vitrea"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/solangek/vitrea-py"
+Homepage = "https://github.com/solangek/vitrea"
 
 [tool.setuptools.packages.find]
 where = ["src"]

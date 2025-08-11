@@ -8,7 +8,7 @@ from vitrea.client import VitreaClient
 logging.basicConfig(level=logging.DEBUG)
 
 @pytest.mark.asyncio
-async def try_connect():
+async def test_connect():
     from vitrea.constants import VitreaEvents
     client = VitreaClient(host='192.168.1.136', port=11502)
 
@@ -41,7 +41,7 @@ async def try_connect():
 
 def main():
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(try_connect())
+    loop.run_until_complete(test_connect())
     loop.close()
 
 if __name__ == "__main__":

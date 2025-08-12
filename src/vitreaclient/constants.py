@@ -15,9 +15,9 @@ class DeviceStatus(Enum):
     SWITCH_OFF = 'F' # light Off
     BLIND = 'B' # blind with position param 0-100
     DIMMER = 'D'
-    SATELLITE_SHORT = 'S' # satellite detected, short message
+    SATELLITE_SHORT = 'S' # scenario / satellite detected, short message
     SATELLITE_LONG = 'L' # satellite detected, long message
-    SATELLITE_RELEASE = 'R' # satellite released
+    SATELLITE_RELEASE = 'R' # scenario / satellite released
     JOINED = 'J' # a node joined the network
     LEFT = 'L' # a node left the network
     ERROR = 'E' # error occurred
@@ -48,13 +48,14 @@ class VitreaCommand:
     SCENARIO_ON = f"H:R{{scenario}}{EOL}" # scneario: 5 bytes
 
 class VitreaResponse(Enum):
-    SCENARIO_OK= f"S:R{{scenario}}:OK{EOL}" # scenario: 5 bytes
-    SCENARIO_ERROR = f"S:R{{scenario}}:ERROR{EOL}" # scenario: 5 bytes, error_code: 3 bytes
-    STATUS = f"S:N{{node}}:{{key}}:{{status}}:{{data}}{EOL}" # node: 2 bytes, key: 2 bytes, status: 1 byte, data: variable length
-    ERROR = f"E:N{{node}}:{{key}}:{{error}}{EOL}"
-    OK = f"S:PSW:OK{EOL}" # node: 2 bytes, key: 2 bytes
-    JOINED = f"J:N{{node}}{EOL}" # node joined the network
-    LEFT = f"L:N{{node}}{EOL}" # node left the network
+    SCENARIO_OK= f"S:R{{scenario}}:OK" # scenario: 5 bytes
+    SCENARIO_ERROR = f"S:R{{scenario}}:ERROR" # scenario: 5 bytes, error_code: 3 bytes
+    STATUS = f"S:N{{node}}:{{key}}:{{status}}:{{data}}" # node: 2 bytes, key: 2 bytes, status: 1 byte, data: variable length
+    ERROR = f"E:N{{node}}:{{key}}:{{error}}"
+    OK = "S:PSW:OK"
+    JOINED = f"J:N{{node}}" # node joined the network
+    LEFT = f"L:N{{node}}" # node left the network
+    OK_VITREA = "OK"
 
 class ErrorCode(Enum):
     WRONG_COMMAND = "001"
@@ -79,11 +80,4 @@ INDEX_KEY = 1
 INDEX_STATUS = 2
 INDEX_DATA = 3
 
-class VitreaEvents(Enum):
-    SCENARIO_OK = "scenario_ok"
-    SCENARIO_ERROR = "scenario_error"
-    RESPONSE_STATUS = "response_status"
-    NODE_JOINED = "node_joined"
-    NODE_LEFT = "node_left"
-    OK = "ok"
 

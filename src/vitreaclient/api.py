@@ -7,11 +7,11 @@ from dataclasses import dataclass
 import threading
 from collections import defaultdict
 
-from src.vitreaclient.constants import VitreaResponse
+from .constants import VitreaResponse
 
 # debug mode
 import logging
-#logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 _LOGGER = logging.getLogger(__name__)
 
 @dataclass
@@ -40,6 +40,10 @@ class ErrorResponse:
 
 @dataclass
 class OkResponse:
+    pass
+
+@dataclass
+class OkVitreaResponse:
     pass
 
 VitreaAnyResponse = Union[ScenarioOkResponse, ScenarioErrorResponse, ErrorResponse, OkResponse, VitreaResponseObject]
@@ -190,7 +194,6 @@ class VitreaSocket:
         _LOGGER.debug("Starting VitreaSocket _read_loop")
         try:
             while self._reader is not None and not self._reader.at_eof():
-                _LOGGER.debug("Waiting to read from socket...")
                 data = await self._reader.read(4096)
 
                 if not data:
@@ -200,7 +203,6 @@ class VitreaSocket:
                     lines = data.split(b'\r\n')
                     for line in lines:
                         if line:
-                            _LOGGER.debug(f"Received: {line}")
                             await self._handle_data(line)
                 if not data.endswith(b'\r\n'):
                     _LOGGER.debug(f"Need to handle extra data: {data}")

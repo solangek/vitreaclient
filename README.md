@@ -14,40 +14,42 @@ pip install vitreaclient
 
 ```python
 from vitreaclient.client import VitreaClient
-from vitreaclient.constants import VitreaEvents
+from vitreaclient.constants import VitreaResponse, DeviceStatus
 import asyncio
 
 
 async def vitrea_test():
-    client = VitreaClient(host='1.2.3.4', port=12345)
-
-    await client.connect()
+    client = VitreaClient(host='192.168.1.100', port=11102)
 
     status_events = []
-
     def on_status(event):
-        print(
-            f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
+        print(f"===> Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
         status_events.append(event)
 
-    print(f"Registering listener for event: {VitreaEvents.RESPONSE_STATUS}")
-    client.on(VitreaEvents.RESPONSE_STATUS.value, on_status)
+    client.on(VitreaResponse.STATUS, on_status)
 
-    # Start the read task to listen for incoming messages
+    def on_ok(event):
+        print(f"===> Event type {event.type}")
+
+    client.on(VitreaResponse.OK, on_ok)
+
+    # connect and start the read task to listen for incoming messages
+    await client.connect()
     await client.start_read_task()
 
     await client.key_off("018", "2")  # Example command to turn on a key
     await asyncio.sleep(2)
     await client.key_on("018", "2")  # Example command to turn off a key
 
-    await asyncio.sleep(10)  # Give time for response
-
     # get the status of all nodes
     await client.status_request()
-    await asyncio.sleep(30)  # Give time for response
+
+    await asyncio.sleep(60)  # Give time for response
     print(f"Status events received: {len(status_events)}")
 
     client.disconnect()
+
+
 
 ```
 

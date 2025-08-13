@@ -26,7 +26,7 @@ class VitreaClient(VitreaSocket, EventEmitter):
         #self._keepalive.set_monitor(self)
 
 
-    async def _handle_data(self, data: bytes) -> VitreaAnyResponse:
+    async def _handle_data(self, data: bytes) -> None:
         """Handle incoming data from the Vitrea box."""
         if isinstance(data, bytes):
             message = data.decode('utf-8').strip()
@@ -63,7 +63,7 @@ class VitreaClient(VitreaSocket, EventEmitter):
             key = parts[2] if len(parts) > 2 else None
             status = parts[3] if len(parts) > 3 else None
             data = parts[4] if len(parts) > 4 else None
-            response = VitreaResponseObject(type=VitreaResponse.STATUS, node=node, key=key, status=DeviceStatus(status), extra={'data': data})
+            response = VitreaResponseObject(type=VitreaResponse.STATUS, node=node, key=key, status=DeviceStatus(status), data=data)
             event = VitreaResponse.STATUS
         # node joined
         if message.startswith("J:N"):

@@ -5,11 +5,11 @@ from src.vitreaclient.constants import VitreaResponse, DeviceStatus
 
 async def example1():
 
-    client = VitreaClient(host='192.168.1.136', port=11502)
+    client = VitreaClient(host='192.168.1.100', port=11502)
 
     status_events = []
     def on_status(event):
-        print(f"===> Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
+        print(f"===> Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, data: {event.data}")
         status_events.append(event)
 
     print(f"Registering listener for event: {VitreaResponse.STATUS}")

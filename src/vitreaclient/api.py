@@ -22,31 +22,8 @@ class VitreaResponseObject:
     scenario: str = None
     error: str = None
     status: str = None
-    extra: dict = None
+    data: dict = None
 
-@dataclass
-class ScenarioOkResponse:
-    scenario: str
-
-@dataclass
-class ScenarioErrorResponse:
-    scenario: str
-
-@dataclass
-class ErrorResponse:
-    node: str
-    key: str
-    error: str
-
-@dataclass
-class OkResponse:
-    pass
-
-@dataclass
-class OkVitreaResponse:
-    pass
-
-VitreaAnyResponse = Union[ScenarioOkResponse, ScenarioErrorResponse, ErrorResponse, OkResponse, VitreaResponseObject]
 
 class EventEmitter:
     def __init__(self):
@@ -210,7 +187,7 @@ class VitreaSocket:
             _LOGGER.debug("Read loop cancelled")
             pass
         except Exception as e:
-            _LOGGER.error(f"Error in read loop: {e}")
+            _LOGGER.debug(f"Error in read loop: {e}")
             await self._cleanup_connection()
             try:
                 await self.connect()

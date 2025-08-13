@@ -56,27 +56,21 @@ import asyncio
 
 
 async def vitrea_test():
-    client = VitreaClient(host='192.168.1.100', port=11502)
+    client = VitreaClient(host='192.168.1.100', port=11102)
 
     status_events = []
     def on_status(event):
-        # convert status char to DeviceStatus
-        if event.status:
-            status = DeviceStatus(event.status)
-        else:
-            status = None
-        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {status}, Extra: {event.extra}")
-
+        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
         status_events.append(event)
 
     client.on(VitreaResponse.STATUS, on_status)
 
     def on_ok(event):
-        print("Event type OK")
+        print(f"Event type {event.type}")
 
     client.on(VitreaResponse.OK, on_ok)
 
-    # Start the read task to listen for incoming messages
+    # connect and start the read task to listen for incoming messages
     await client.connect()
     await client.start_read_task()
 
@@ -87,9 +81,8 @@ async def vitrea_test():
     # get the status of all nodes
     await client.status_request()
 
-    await asyncio.sleep(10)  # Give time for response
+    await asyncio.sleep(60)  # Give time for response
     print(f"Status events received: {len(status_events)}")
-    assert len(status_events) > 0, "No status events received"
 
     client.disconnect()
 

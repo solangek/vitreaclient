@@ -20,7 +20,7 @@ async def test_connect():
             status = DeviceStatus(event.status)
         else:
             status = None
-        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {status}, Extra: {event.extra}")
+        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {status}, data: {event.data}")
 
         status_events.append(event)
 

@@ -13,7 +13,7 @@ class DeviceStatus(Enum):
     BOILER_OFF = 'f' # boiler off
     SWITCH_ON = 'O' # light On
     SWITCH_OFF = 'F' # light Off
-    BLIND = 'B' # blind with position param 0-100
+    BLIND = 'B' # blind with position param 0-100 - sent twice by vitrea (up and down)
     DIMMER = 'D'
     SATELLITE_SHORT = 'S' # scenario / satellite detected, short message
     SATELLITE_LONG = 'L' # satellite detected, long message

@@ -23,13 +23,13 @@ async def vitrea_test():
 
     status_events = []
     def on_status(event):
-        print(f"===> Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
+        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, data: {event.data}")
         status_events.append(event)
 
     client.on(VitreaResponse.STATUS, on_status)
 
     def on_ok(event):
-        print(f"===> Event type {event.type}")
+        print(f"Event type {event.type}")
 
     client.on(VitreaResponse.OK, on_ok)
 

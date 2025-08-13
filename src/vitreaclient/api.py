@@ -38,6 +38,14 @@ class EventEmitter:
                 raise ValueError(f"Callback for event '{event_name}' must be callable")
             self._events[event_name].append(callback)
 
+    def on_once(self, event_name: VitreaResponse, callback):
+        """Register a one-time listener for an event."""
+        def wrapper(*args, **kwargs):
+            callback(*args, **kwargs)
+            self.off(event_name, wrapper)
+
+        self.on(event_name, wrapper)
+
     def emit(self, event_name: VitreaResponse, *args, **kwargs):
         with self._lock:
             listeners = list(self._events.get(event_name, []))

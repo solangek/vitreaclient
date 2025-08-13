@@ -3,11 +3,6 @@
 from enum import Enum
 from typing import Dict
 
-DOMAIN = "vitreaclient"
-
-MONITOR = 'VITREA_MONITOR'
-SWITCHES = 'VITREA_SWITCHES'
-
 class DeviceStatus(Enum):
     BOILER_ON = 'o' # boiler on with timer parameter
     BOILER_OFF = 'f' # boiler off
@@ -74,10 +69,5 @@ ERROR_MESSAGES: Dict[str, str] = {
     ErrorCode.WRONG_SCENARIO.value: "Wrong Scenario"
 }
 
-# Index constants for parsing
-INDEX_NODE = 0
-INDEX_KEY = 1
-INDEX_STATUS = 2
-INDEX_DATA = 3
 
 

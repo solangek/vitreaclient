@@ -32,11 +32,24 @@ class EventEmitter:
         self._lock = threading.Lock()
 
     def on(self, event_name : VitreaResponse, callback):
+        """Register a listener for an event."""
         with self._lock:
             _LOGGER.debug(f"Registering listener for event '{event_name}'")
             if not callable(callback):
                 raise ValueError(f"Callback for event '{event_name}' must be callable")
             self._events[event_name].append(callback)
+
+    def off(self, event_name: VitreaResponse, callback):
+        """Unregister a listener for an event."""
+        with self._lock:
+            _LOGGER.debug(f"Unregistering listener for event '{event_name}'")
+            if event_name in self._events:
+                try:
+                    self._events[event_name].remove(callback)
+                except ValueError:
+                    _LOGGER.warning(f"Callback not found for event '{event_name}'")
+            else:
+                _LOGGER.warning(f"No listeners registered for event '{event_name}'")
 
     def on_once(self, event_name: VitreaResponse, callback):
         """Register a one-time listener for an event."""

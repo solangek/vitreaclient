@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vitreaclient
-Version: 0.1.4
+Version: 0.1.5
 Summary: Python package encapsulating Vitrea box communication protocol.
 Author-email: SK <skappdevel@gmail.com>
 License: Copyright (c) 2018 The Python Packaging Authority
@@ -60,7 +60,7 @@ async def vitrea_test():
 
     status_events = []
     def on_status(event):
-        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, Extra: {event.extra}")
+        print(f"Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, data: {event.data}")
         status_events.append(event)
 
     client.on(VitreaResponse.STATUS, on_status)

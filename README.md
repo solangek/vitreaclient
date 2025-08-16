@@ -13,8 +13,7 @@ pip install vitreaclient
 ## Usage
 
 ```python
-from vitreaclient.client import VitreaClient
-from vitreaclient.constants import VitreaResponse, DeviceStatus
+from vitreaclient.client import VitreaClient, VitreaResponse, DeviceStatus
 import asyncio
 
 
@@ -46,7 +45,10 @@ async def vitrea_test():
 
     await asyncio.sleep(60)  # Give time for response
     print(f"Status events received: {len(status_events)}")
-
+    # unsubscribe from events
+    client.off(VitreaResponse.STATUS, on_status)
+    client.off(VitreaResponse.OK, on_ok)
+    
     client.disconnect()
 
 

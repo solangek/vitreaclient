@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import threading
 from collections import defaultdict
 
-from .constants import VitreaResponse
+from .constants import VitreaResponse, DeviceStatus
 
 # debug mode
 import logging
@@ -16,12 +16,12 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class VitreaResponseObject:
-    type: str
+    type: VitreaResponse = None
     node: str = None
     key: str = None
     scenario: str = None
     error: str = None
-    status: str = None
+    status: DeviceStatus = None
     data: dict = None
 
 
@@ -101,7 +101,7 @@ class VitreaSocket:
         self._reconnect_attempt = 0
         while self._max_reconnect_attempts is None or self._reconnect_attempt < self._max_reconnect_attempts:
             try:
-                await self._cleanup_connection()
+                await self.cleanup_connection()
                 self._reader, self._writer = await asyncio.wait_for(
                     asyncio.open_connection(self.host, self.port),
                     timeout=10
@@ -130,7 +130,7 @@ class VitreaSocket:
             except Exception as e:
                 _LOGGER.error(f"Unexpected error connecting to Vitrea box: {e}")
                 self._connection_state.clear()  # Mark as disconnected
-                await self._cleanup_connection()
+                await self.cleanup_connection()
                 raise
 
     async def start_read_task(self) -> None:
@@ -140,7 +140,7 @@ class VitreaSocket:
             self._read_task = asyncio.create_task(self._read_loop())
             _LOGGER.debug("Read loop task started")
 
-    async def _cleanup_connection(self) -> None:
+    async def cleanup_connection(self) -> None:
         if self._read_task is not None and not self._read_task.done():
             self._read_task.cancel()
             try:
@@ -165,7 +165,7 @@ class VitreaSocket:
             _LOGGER.info("Forced a disconnection")
             if self._keepalive is not None:
                 self._keepalive.pause()
-            asyncio.create_task(self._cleanup_connection())
+            asyncio.create_task(self.cleanup_connection())
 
     async def write(self, data: bytes) -> None:
         async with self._mutex:
@@ -209,7 +209,7 @@ class VitreaSocket:
             pass
         except Exception as e:
             _LOGGER.debug(f"Error in read loop: {e}")
-            await self._cleanup_connection()
+            await self.cleanup_connection()
             try:
                 await self.connect()
                 _LOGGER.debug("Connection established, restarting read loop")

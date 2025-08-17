@@ -31,9 +31,16 @@ async def example1():
     #await client.key_on("018", "2")  # Example command to turn off a key
 
     # get the status of all nodes
-    await client.status_request()
+    #await client.status_request()
 
-    await asyncio.sleep(180)  # Give time for response
+    await client.set_timer("002", "1", 10)  # Example command to set a timer for node 002, key 1 for 5 minutes
+
+    await asyncio.sleep(10)  # Give time for response
+    await client.key_off("002", "1")  # Example command to turn off the key
+    await asyncio.sleep(5)  # Give time for response
+    await client.key_on("002", "1")
+
+
     print(f"Status events received: {len(status_events)}")
     assert len(status_events) > 0, "No status events received"
 

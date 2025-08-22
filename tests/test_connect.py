@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.DEBUG)
 @pytest.mark.asyncio
 async def test_connect():
 
-    client = VitreaClient(host='192.168.1.136', port=11502)
+    client = VitreaClient(host='192.168.1.100', port=11502)
 
     status_events = []
     def on_status(event):
@@ -50,12 +50,7 @@ async def test_connect():
 
 
 def main():
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(test_connect())
-    loop.close()
+    asyncio.run(test_connect())
 
 if __name__ == "__main__":
     main()
-    # Run the main function to test the connection
-    #asyncio.run(try_connect())  # Uncomment this line if you want to run it
-

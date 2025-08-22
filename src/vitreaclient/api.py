@@ -60,6 +60,7 @@ class EventEmitter:
         self.on(event_name, wrapper)
 
     def emit(self, event_name: VitreaResponse, *args, **kwargs):
+        """Emit an event to all registered listeners."""
         with self._lock:
             listeners = list(self._events.get(event_name, []))
         for callback in listeners:
@@ -110,6 +111,10 @@ class VitreaSocket:
                 self.sock = self._socket
                 _LOGGER.debug(f"Connected to Vitrea box at {self.host}:{self.port}")
                 self._connection_state.set()  # Mark as connected
+
+                # Restart the read task after successful reconnection
+                await self.start_read_task()
+
                 if self._keepalive:
                     self._keepalive.enable()
                 self._reconnect_attempt = 0
@@ -177,45 +182,99 @@ class VitreaSocket:
                     await self.connect()
                 except Exception as e:
                     _LOGGER.error(f"Failed to reconnect: {e}")
-                    return
+                    raise
                 if self._writer is None or self._writer.is_closing():
                     _LOGGER.error("Still no valid connection after reconnect attempt")
-                    return
-            try:
-                self._writer.write(data)
-                await self._writer.drain()
-            except Exception as e:
-                _LOGGER.error(f"Data written with an error - {e}")
-                self._writer = None
+                    raise ConnectionError("Unable to establish connection for write operation")
+
+            retry_count = 0
+            max_retries = 3
+
+            while retry_count < max_retries:
+                try:
+                    self._writer.write(data)
+                    await self._writer.drain()
+                    return  # Success, exit the method
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                    _LOGGER.warning(f"Socket error during write (attempt {retry_count + 1}): {e}")
+                    retry_count += 1
+                    self._connection_state.clear()  # Mark as disconnected
+
+                    if retry_count < max_retries:
+                        _LOGGER.debug("Attempting to reconnect after write error...")
+                        if self._keepalive is not None:
+                            self._keepalive.pause()
+                        try:
+                            await self.cleanup_connection()
+                            await self.connect()
+                        except Exception as reconnect_error:
+                            _LOGGER.error(f"Reconnection failed (attempt {retry_count}): {reconnect_error}")
+                            if retry_count == max_retries - 1:
+                                raise ConnectionError(f"Failed to write data after {max_retries} attempts: {e}")
+                    else:
+                        raise ConnectionError(f"Failed to write data after {max_retries} attempts: {e}")
+                except Exception as e:
+                    _LOGGER.error(f"Unexpected error during write: {e}")
+                    self._connection_state.clear()
+                    raise
 
     async def _read_loop(self) -> None:
         _LOGGER.debug("Starting VitreaSocket _read_loop")
-        try:
-            while self._reader is not None and not self._reader.at_eof():
-                data = await self._reader.read(4096)
+        retry_count = 0
+        max_retries = 5
+        base_delay = 1
 
-                if not data:
-                    _LOGGER.debug("No data received, breaking read loop.")
-                    break
-                if b'\r\n' in data:
-                    lines = data.split(b'\r\n')
-                    for line in lines:
-                        if line:
-                            await self._handle_data(line)
-                if not data.endswith(b'\r\n'):
-                    _LOGGER.debug(f"Need to handle extra data: {data}")
-        except asyncio.CancelledError:
-            _LOGGER.debug("Read loop cancelled")
-            pass
-        except Exception as e:
-            _LOGGER.debug(f"Error in read loop: {e}")
-            await self.cleanup_connection()
+        while retry_count < max_retries:
             try:
-                await self.connect()
-                _LOGGER.debug("Connection established, restarting read loop")
-                self._read_task = asyncio.create_task(self._read_loop())
-            except Exception as ex:
-                _LOGGER.error("Failed to restart read loop: %s", ex)
+                while self._reader is not None and not self._reader.at_eof():
+                    data = await self._reader.read(4096)
+
+                    if not data:
+                        _LOGGER.debug("No data received, connection may be closed.")
+                        raise ConnectionError("No data received, connection closed")
+
+                    if b'\r\n' in data:
+                        lines = data.split(b'\r\n')
+                        for line in lines:
+                            if line:
+                                await self._handle_data(line)
+                    if not data.endswith(b'\r\n'):
+                        _LOGGER.debug(f"Need to handle extra data: {data}")
+
+                # If we reach here, the loop ended normally
+                _LOGGER.debug("Read loop ended normally")
+                break
+
+            except asyncio.CancelledError:
+                _LOGGER.debug("Read loop cancelled")
+                break
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError, ConnectionError) as e:
+                retry_count += 1
+                _LOGGER.warning(f"Socket error in read loop (attempt {retry_count}): {e}")
+                self._connection_state.clear()  # Mark as disconnected
+
+                if retry_count < max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))
+                    _LOGGER.debug(f"Attempting to reconnect in {delay} seconds...")
+                    await asyncio.sleep(delay)
+
+                    try:
+                        await self.cleanup_connection()
+                        await self.connect()
+                        _LOGGER.debug("Connection re-established, continuing read loop")
+                        retry_count = 0  # Reset retry count on successful reconnection
+                    except Exception as reconnect_error:
+                        _LOGGER.error(f"Reconnection failed (attempt {retry_count}): {reconnect_error}")
+                        if retry_count >= max_retries:
+                            _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop")
+                            break
+                else:
+                    _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop")
+                    break
+            except Exception as e:
+                _LOGGER.error(f"Unexpected error in read loop: {e}")
+                self._connection_state.clear()
+                break
 
     async def _handle_data(self, data: bytes) -> None:
         """Handle incoming data from socket. To be implemented by subclasses."""
@@ -296,18 +355,70 @@ class VitreaKeepAliveHandler:
             self._task.cancel()
 
     async def _keepalive_loop(self):
-        """Keepalive loop."""
+        """Keepalive loop with reconnection logic."""
+        consecutive_failures = 0
+
         while self.enabled:
             try:
                 if self.monitor:
-                    await self.monitor.send_keepalive()
+                    # Check if connection is still valid before sending keepalive
+                    if not self.monitor.is_connected():
+                        _LOGGER.warning("Connection lost detected by keepalive, attempting reconnection")
+                        try:
+                            await self.monitor.connect()
+                            consecutive_failures = 0  # Reset on successful reconnection
+                        except Exception as reconnect_error:
+                            consecutive_failures += 1
+                            _LOGGER.error(f"Keepalive reconnection failed (attempt {consecutive_failures}): {reconnect_error}")
+
+                            if consecutive_failures >= self._max_failures:
+                                _LOGGER.error(f"Max keepalive reconnection failures ({self._max_failures}) reached, disabling keepalive.")
+                                self.enabled = False
+                                break
+
+                            # Wait before next attempt with exponential backoff
+                            backoff_delay = min(30, 2 ** consecutive_failures)
+                            await asyncio.sleep(backoff_delay)
+                            continue
+                    else:
+                        await self.monitor.send_keepalive()
+                        consecutive_failures = 0  # Reset on successful keepalive
+
                 await asyncio.sleep(self.interval)
+
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as ex:
+                consecutive_failures += 1
+                _LOGGER.warning(f"Socket error in keepalive (attempt {consecutive_failures}): {ex}")
+
+                if consecutive_failures >= self._max_failures:
+                    _LOGGER.error(f"Max keepalive failures ({self._max_failures}) reached, triggering reconnection")
+                    if self.monitor:
+                        try:
+                            await self.monitor.connect()
+                            consecutive_failures = 0
+                        except Exception as reconnect_error:
+                            _LOGGER.error(f"Keepalive triggered reconnection failed: {reconnect_error}")
+                            self.enabled = False
+                            break
+                else:
+                    # Wait before retry with exponential backoff
+                    backoff_delay = min(30, 2 ** consecutive_failures)
+                    await asyncio.sleep(backoff_delay)
+
+            except asyncio.CancelledError:
+                _LOGGER.debug("Keepalive loop cancelled")
+                break
             except Exception as ex:
-                _LOGGER.error("Keepalive error: %s", ex)
-                self._connection_lost_count += 1
-                if self._connection_lost_count >= self._max_failures:
-                    _LOGGER.error("Max keepalive failures reached, disabling keepalive.")
+                consecutive_failures += 1
+                _LOGGER.error(f"Unexpected keepalive error (attempt {consecutive_failures}): {ex}")
+
+                if consecutive_failures >= self._max_failures:
+                    _LOGGER.error(f"Max keepalive failures ({self._max_failures}) reached, disabling keepalive.")
                     self.enabled = False
+                    break
+
+                # Wait before retry
+                await asyncio.sleep(min(30, 2 ** consecutive_failures))
 
     def restart(self):
         """Restart the keepalive handler."""

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vitreaclient
-Version: 0.1.7
+Version: 0.1.8
 Summary: Python package encapsulating Vitrea box communication protocol.
 Author-email: SK <skappdevel@gmail.com>
 License: Copyright (c) 2018 The Python Packaging Authority

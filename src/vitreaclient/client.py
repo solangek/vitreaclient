@@ -25,6 +25,10 @@ class VitreaClient(VitreaSocket, EventEmitter):
         self._keepalive = VitreaKeepAliveHandler(self, interval_seconds=19)
         #self._keepalive.set_monitor(self)
 
+    async def close(self) -> None:
+        """Properly close the client and all resources."""
+        _LOGGER.info("Closing VitreaClient")
+        await super().close()
 
     async def _handle_data(self, data: bytes) -> None:
         """Handle incoming data from the Vitrea box."""

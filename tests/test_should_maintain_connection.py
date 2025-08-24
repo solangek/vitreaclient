@@ -1,9 +1,13 @@
 """Tests for connection maintenance behavior in VitreaSocket."""
 
 import asyncio
+import os
+import sys
+
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
-from src.vitreaclient.api import VitreaSocket, VitreaKeepAliveHandler
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
+from vitreaclient.api import VitreaSocket, VitreaKeepAliveHandler
 
 
 class TestShouldMaintainConnection:

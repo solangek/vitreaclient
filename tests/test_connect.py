@@ -2,6 +2,7 @@
 
 import asyncio
 import pytest
+import socket as socket_module
 from unittest.mock import Mock, AsyncMock, patch
 from src.vitreaclient.api import VitreaSocket, VitreaKeepAliveHandler
 
@@ -25,43 +26,66 @@ class TestConnection:
         assert socket._read_task is None
         assert not socket.is_connected()
         assert socket._should_maintain_connection is True
-        assert not await socket.is_reconnecting()
+        assert not socket._is_reconnecting
 
     @pytest.mark.asyncio
     async def test_successful_connection(self, socket):
         """Test successful connection establishment."""
-        with patch('asyncio.open_connection') as mock_open:
-            reader = Mock()
-            writer = Mock()
-            writer.is_closing.return_value = False
-            writer.get_extra_info.return_value = Mock()
-            mock_open.return_value = (reader, writer)
+        reader = Mock()
+        reader.at_eof.return_value = False  # Mock reader is not at EOF
+        writer = Mock()
+        writer.is_closing.return_value = False
+        mock_socket = Mock()
+        writer.get_extra_info.return_value = mock_socket
 
-            # Mock start_read_task to avoid actual task creation
-            socket.start_read_task = AsyncMock()
+        with patch('asyncio.wait_for') as mock_wait_for:
+            mock_wait_for.return_value = (reader, writer)
 
-            await socket.connect()
+            with patch.object(socket, 'cleanup_connection', new_callable=AsyncMock) as mock_cleanup:
+                # Mock keepalive operations
+                mock_keepalive = Mock()
+                mock_keepalive.enabled = False
+                mock_keepalive.enable = AsyncMock()
+                mock_keepalive.resume_after_reconnection = AsyncMock()
+                socket._keepalive = mock_keepalive
 
-            # Verify connection was established
-            assert socket._reader == reader
-            assert socket._writer == writer
-            assert socket.is_connected()
-            assert socket._connection_state.is_set()
-            mock_open.assert_called_once_with("localhost", 8080)
+                # Create a mock read task that appears to be running
+                mock_read_task = Mock()
+                mock_read_task.done.return_value = False  # Task is still running
+
+                # Mock start_read_task to set up the mock read task
+                async def mock_start_read_task():
+                    socket._read_task = mock_read_task
+
+                with patch.object(socket, 'start_read_task', side_effect=mock_start_read_task):
+                    await socket.connect()
+
+                    # Verify connection was established
+                    assert socket._reader == reader
+                    assert socket._writer == writer
+                    assert socket._socket == mock_socket
+                    assert socket.sock == mock_socket
+                    assert socket.is_connected()
+                    assert socket._connection_state.is_set()
+
+                    # Verify the flow was called
+                    mock_wait_for.assert_called_once()
+                    mock_cleanup.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_connection_already_connected(self, socket):
         """Test that connect() returns early if already connected."""
         # Set up existing connection
-        socket._writer = Mock()
-        socket._writer.is_closing.return_value = False
+        writer = Mock()
+        writer.is_closing.return_value = False
+        socket._writer = writer
         socket._connection_state.set()
 
-        with patch('asyncio.open_connection') as mock_open:
+        with patch('asyncio.wait_for') as mock_wait_for:
             await socket.connect()
 
             # Should not attempt new connection
-            mock_open.assert_not_called()
+            mock_wait_for.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_connection_timeout(self, socket):
@@ -69,10 +93,11 @@ class TestConnection:
         # Set max attempts to prevent infinite retry loop
         socket._max_reconnect_attempts = 1
 
-        with patch('asyncio.open_connection', side_effect=asyncio.TimeoutError("Timeout")):
+        with patch('asyncio.wait_for', side_effect=asyncio.TimeoutError("Timeout")):
             with patch('asyncio.sleep'):  # Speed up test
-                with pytest.raises(ConnectionError, match="Failed to connect to Vitrea box"):
-                    await socket.connect()
+                with patch.object(socket, 'cleanup_connection', new_callable=AsyncMock):
+                    with pytest.raises(ConnectionError, match="Failed to connect to Vitrea box"):
+                        await socket.connect()
 
     @pytest.mark.asyncio
     async def test_is_connected_states(self, socket):
@@ -80,18 +105,26 @@ class TestConnection:
         # Not connected initially
         assert not socket.is_connected()
 
-        # Connected state
-        socket._writer = Mock()
-        socket._writer.is_closing.return_value = False
+        # Connected state - need all conditions satisfied
+        reader = Mock()
+        reader.at_eof.return_value = False  # Reader not at EOF
+        writer = Mock()
+        writer.is_closing.return_value = False
+        mock_read_task = Mock()
+        mock_read_task.done.return_value = False  # Task is running
+
+        socket._reader = reader
+        socket._writer = writer
+        socket._read_task = mock_read_task
         socket._connection_state.set()
         assert socket.is_connected()
 
         # Writer closing
-        socket._writer.is_closing.return_value = True
+        writer.is_closing.return_value = True
         assert not socket.is_connected()
 
         # Connection state cleared
-        socket._writer.is_closing.return_value = False
+        writer.is_closing.return_value = False
         socket._connection_state.clear()
         assert not socket.is_connected()
 
@@ -100,33 +133,44 @@ class TestConnection:
         socket._connection_state.set()
         assert not socket.is_connected()
 
+        # Reader at EOF
+        socket._writer = writer
+        reader.at_eof.return_value = True
+        assert not socket.is_connected()
+
+        # Read task done
+        reader.at_eof.return_value = False
+        mock_read_task.done.return_value = True
+        assert not socket.is_connected()
+
     @pytest.mark.asyncio
     async def test_cleanup_connection(self, socket):
         """Test connection cleanup functionality."""
         # Set up connection with read task
-        socket._reader = Mock()
-        socket._writer = Mock()
-        socket._writer.close = Mock()
-        socket._writer.wait_closed = AsyncMock()
+        reader = Mock()
+        writer = Mock()
+        writer.close = Mock()
+        writer.wait_closed = AsyncMock()
+        socket._reader = reader
+        socket._writer = writer
         socket._connection_state.set()
 
-        # Create a real asyncio task that we can control
-        async def dummy_task():
-            # This task will be cancelled, so it should raise CancelledError
-            await asyncio.sleep(100)  # Long sleep that will be cancelled
+        # Create a real asyncio task for testing cancellation
+        async def dummy_read_loop():
+            try:
+                await asyncio.sleep(100)  # This will be cancelled
+            except asyncio.CancelledError:
+                raise  # Re-raise to simulate proper cancellation
 
-        read_task = asyncio.create_task(dummy_task())
+        read_task = asyncio.create_task(dummy_read_loop())
         socket._read_task = read_task
-
-        # Capture references before cleanup since they'll be set to None
-        writer_mock = socket._writer
 
         await socket.cleanup_connection()
 
         # Verify cleanup
         assert read_task.cancelled()  # Task should be cancelled
-        writer_mock.close.assert_called_once()
-        writer_mock.wait_closed.assert_called_once()
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_called_once()
         assert socket._reader is None
         assert socket._writer is None
         assert socket._read_task is None
@@ -135,9 +179,10 @@ class TestConnection:
     @pytest.mark.asyncio
     async def test_cleanup_connection_with_error(self, socket):
         """Test cleanup handles writer close errors gracefully."""
-        socket._writer = Mock()
-        socket._writer.close.side_effect = Exception("Close error")
-        socket._writer.wait_closed = AsyncMock()
+        writer = Mock()
+        writer.close.side_effect = Exception("Close error")
+        writer.wait_closed = AsyncMock()
+        socket._writer = writer
         socket._connection_state.set()
 
         # Should not raise exception
@@ -150,53 +195,88 @@ class TestConnection:
     @pytest.mark.asyncio
     async def test_start_read_task(self, socket):
         """Test read task starting functionality."""
-        # Mock connection
-        socket._reader = Mock()
-        socket._read_loop = AsyncMock()
+        # Mock connection and read loop
+        reader = Mock()
+        socket._reader = reader
 
-        await socket.start_read_task()
+        # Mock the _read_loop method
+        with patch.object(socket, '_read_loop', new_callable=AsyncMock) as mock_read_loop:
+            # Make the read loop run indefinitely (simulating real behavior)
+            async def long_running_task():
+                await asyncio.sleep(100)  # Long sleep to simulate continuous reading
+            mock_read_loop.side_effect = long_running_task
 
-        # Verify task was created
-        assert socket._read_task is not None
-        assert not socket._read_task.done()
+            await socket.start_read_task()
+
+            # Verify task was created and is running
+            assert socket._read_task is not None
+            assert not socket._read_task.done()
+
+            # Clean up the task
+            if socket._read_task and not socket._read_task.done():
+                socket._read_task.cancel()
+                try:
+                    await socket._read_task
+                except asyncio.CancelledError:
+                    pass
 
     @pytest.mark.asyncio
     async def test_start_read_task_when_no_reader(self, socket):
-        """Test that start_read_task connects if no reader exists."""
-        socket.connect = AsyncMock()
-        socket._read_loop = AsyncMock()
+        """Test that start_read_task handles no reader gracefully."""
+        # No reader set
+        socket._reader = None
 
-        await socket.start_read_task()
+        with patch.object(socket, '_read_loop', new_callable=AsyncMock):
+            await socket.start_read_task()
 
-        # Should attempt to connect first
-        socket.connect.assert_called_once()
+            # Should not create task when no reader
+            assert socket._read_task is None
 
     @pytest.mark.asyncio
     async def test_start_read_task_replaces_done_task(self, socket):
         """Test that start_read_task replaces done tasks."""
-        socket._reader = Mock()
-        socket._read_loop = AsyncMock()
+        reader = Mock()
+        socket._reader = reader
 
-        # Create initial task
-        await socket.start_read_task()
-        first_task = socket._read_task
+        # Create an already done task
+        async def completed_task():
+            return "completed"
 
-        # Mark task as done
-        first_task.done = Mock(return_value=True)
+        first_task = asyncio.create_task(completed_task())
+        await first_task  # Wait for it to complete
+        socket._read_task = first_task
 
-        # Start new task
-        await socket.start_read_task()
-        second_task = socket._read_task
+        assert first_task.done()
 
-        # Should be different task
-        assert second_task != first_task
+        # Mock the read loop for the new task
+        with patch.object(socket, '_read_loop', new_callable=AsyncMock) as mock_read_loop:
+            async def long_running_task():
+                await asyncio.sleep(100)
+            mock_read_loop.side_effect = long_running_task
+
+            await socket.start_read_task()
+
+            second_task = socket._read_task
+
+            # Should be different task
+            assert second_task != first_task
+            assert not second_task.done()
+
+            # Clean up
+            if second_task and not second_task.done():
+                second_task.cancel()
+                try:
+                    await second_task
+                except asyncio.CancelledError:
+                    pass
 
     @pytest.mark.asyncio
     async def test_create_new_socket(self, socket):
         """Test socket creation."""
         new_socket = socket._create_new_socket()
-        assert new_socket.family == 2  # AF_INET
-        assert new_socket.type == 1    # SOCK_STREAM
+        assert new_socket.family == socket_module.AF_INET
+        assert new_socket.type == socket_module.SOCK_STREAM
+        new_socket.close()  # Clean up
 
     @pytest.mark.asyncio
     async def test_connection_state_event(self, socket):
@@ -223,15 +303,16 @@ class TestConnection:
         assert socket._should_maintain_connection is False
 
         # Re-enabled on explicit connect
-        with patch('asyncio.open_connection') as mock_open:
-            reader, writer = Mock(), Mock()
-            writer.is_closing.return_value = False
-            writer.get_extra_info.return_value = Mock()
-            mock_open.return_value = (reader, writer)
-            socket.start_read_task = AsyncMock()
+        reader = Mock()
+        writer = Mock()
+        writer.is_closing.return_value = False
+        writer.get_extra_info.return_value = Mock()
 
-            await socket.connect()
-            assert socket._should_maintain_connection is True
+        with patch('asyncio.wait_for', return_value=(reader, writer)):
+            with patch.object(socket, 'start_read_task', new_callable=AsyncMock):
+                with patch.object(socket, 'cleanup_connection', new_callable=AsyncMock):
+                    await socket.connect()
+                    assert socket._should_maintain_connection is True
 
     @pytest.mark.asyncio
     async def test_host_port_properties(self, socket):
@@ -252,20 +333,20 @@ class TestConnection:
         assert socket._socket is None
 
         # Set up connection
-        with patch('asyncio.open_connection') as mock_open:
-            reader = Mock()
-            writer = Mock()
-            writer.is_closing.return_value = False
-            mock_socket = Mock()
-            writer.get_extra_info.return_value = mock_socket
-            mock_open.return_value = (reader, writer)
-            socket.start_read_task = AsyncMock()
+        reader = Mock()
+        writer = Mock()
+        writer.is_closing.return_value = False
+        mock_socket_obj = Mock()
+        writer.get_extra_info.return_value = mock_socket_obj
 
-            await socket.connect()
+        with patch('asyncio.wait_for', return_value=(reader, writer)):
+            with patch.object(socket, 'start_read_task', new_callable=AsyncMock):
+                with patch.object(socket, 'cleanup_connection', new_callable=AsyncMock):
+                    await socket.connect()
 
-            # Verify socket references are set
-            assert socket.sock == mock_socket
-            assert socket._socket == mock_socket
+                    # Verify socket references are set
+                    assert socket.sock == mock_socket_obj
+                    assert socket._socket == mock_socket_obj
 
     @pytest.mark.asyncio
     async def test_mutex_usage(self, socket):
@@ -289,3 +370,101 @@ class TestConnection:
         keepalive = VitreaKeepAliveHandler(monitor=socket)
         socket._keepalive = keepalive
         assert socket._keepalive == keepalive
+
+    @pytest.mark.asyncio
+    async def test_write_method_basic(self, socket):
+        """Test basic write functionality."""
+        # Set up connected state
+        writer = Mock()
+        writer.is_closing.return_value = False
+        writer.write = Mock()
+        writer.drain = AsyncMock()
+        socket._writer = writer
+        socket._connection_state.set()
+
+        test_data = b"test message"
+
+        await socket.write(test_data)
+
+        writer.write.assert_called_once_with(test_data)
+        writer.drain.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_write_method_reconnects_on_error(self, socket):
+        """Test that write method handles connection errors by reconnecting."""
+        # Set up initial writer that will fail
+        failing_writer = Mock()
+        failing_writer.is_closing.return_value = False
+        failing_writer.write = Mock(side_effect=ConnectionResetError("Connection lost"))
+        failing_writer.drain = AsyncMock()
+        socket._writer = failing_writer
+        socket._connection_state.set()
+
+        # Set up successful reconnection
+        new_writer = Mock()
+        new_writer.is_closing.return_value = False
+        new_writer.write = Mock()
+        new_writer.drain = AsyncMock()
+
+        with patch.object(socket, 'cleanup_connection', new_callable=AsyncMock):
+            with patch.object(socket, 'connect', new_callable=AsyncMock) as mock_connect:
+                # After connect is called, set up the new writer
+                def setup_new_writer(*args, **kwargs):
+                    socket._writer = new_writer
+                    socket._connection_state.set()
+                mock_connect.side_effect = setup_new_writer
+
+                test_data = b"test message"
+                await socket.write(test_data)
+
+                # Should have tried to reconnect
+                mock_connect.assert_called()
+                # Should have written with new writer
+                new_writer.write.assert_called_with(test_data)
+                new_writer.drain.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_method(self, socket):
+        """Test disconnect functionality."""
+        # Set up connected state with keepalive
+        writer = Mock()
+        writer.close = Mock()
+        writer.wait_closed = AsyncMock()
+        socket._writer = writer
+        socket._connection_state.set()
+
+        # Mock keepalive
+        keepalive = Mock()
+        keepalive.disable = AsyncMock()
+        socket._keepalive = keepalive
+
+        await socket.disconnect()
+
+        # Should disable maintenance and clean up
+        assert not socket._should_maintain_connection
+        keepalive.disable.assert_called_once()
+        assert socket._writer is None
+        assert not socket._connection_state.is_set()
+
+    @pytest.mark.asyncio
+    async def test_close_method(self, socket):
+        """Test close functionality."""
+        # Set up connected state with keepalive
+        writer = Mock()
+        writer.close = Mock()
+        writer.wait_closed = AsyncMock()
+        socket._writer = writer
+        socket._connection_state.set()
+
+        # Mock keepalive
+        keepalive = Mock()
+        keepalive.disable = AsyncMock()
+        socket._keepalive = keepalive
+
+        await socket.close()
+
+        # Should disable maintenance and clean up
+        assert not socket._should_maintain_connection
+        keepalive.disable.assert_called_once()
+        assert socket._writer is None
+        assert not socket._connection_state.is_set()

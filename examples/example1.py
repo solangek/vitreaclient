@@ -1,58 +1,94 @@
 import asyncio
+import sys
+import os
+import logging
 
-from src import VitreaClient
-from src.vitreaclient.constants import VitreaResponse, DeviceStatus
+# Add the src directory to the path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from vitreaclient.client import VitreaClient
+from vitreaclient.constants import VitreaResponse, DeviceStatus
+
+# Configure logging to see what's happening
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 async def example1():
+    print("Starting Vitrea client example...")
 
-    client = VitreaClient(host='192.168.1.100', port=11502)
+    client = VitreaClient(host='192.168.1.136', port=11502)
 
     status_events = []
     def on_status(event):
-        print(f"===> Event type: {event.type}, Node: {event.node}, Key: {event.key}, Status: {event.status}, data: {event.data}")
+        print(f"===> Status Event - Node: {event.node}, Key: {event.key}, Status: {event.status}, Data: {event.data}")
         status_events.append(event)
 
-    print(f"Registering listener for event: {VitreaResponse.STATUS}")
-    client.on(VitreaResponse.STATUS, on_status)
-
     def on_ok(event):
-        print(f"===> Event type {event.type}")
+        print(f"===> OK Event - Type: {event.type}")
 
-    print(f"Registering listener for event: {VitreaResponse.OK}")
+    def on_joined(event):
+        print(f"===> Node Joined - Node: {event.node}")
+
+    def on_left(event):
+        print(f"===> Node Left - Node: {event.node}")
+
+    # Register event listeners
+    print("Registering event listeners...")
+    client.on(VitreaResponse.STATUS, on_status)
     client.on(VitreaResponse.OK, on_ok)
     client.on(VitreaResponse.OK_VITREA, on_ok)
+    client.on(VitreaResponse.JOINED, on_joined)
+    client.on(VitreaResponse.LEFT, on_left)
 
-    # Start the read task to listen for incoming messages
-    await client.connect()
-    await client.start_read_task()
+    try:
+        # Connect to the Vitrea box
+        print("Connecting to Vitrea box...")
+        await client.connect()
+        print("Connected successfully!")
 
-    #await client.key_off("018", "2")  # Example command to turn on a key
-    #await asyncio.sleep(2)
-    #await client.key_on("018", "2")  # Example command to turn off a key
+        # Give a moment for any initial messages
+        await asyncio.sleep(1)
 
-    # get the status of all nodes
-    #await client.status_request()
+        # Send some commands and wait for responses
+        print("Sending key off command...")
+        await client.key_off("018", "2")
+        await asyncio.sleep(1)
 
-    await client.set_timer("002", "1", 10)  # Example command to set a timer for node 002, key 1 for 5 minutes
+        print("Sending key on command...")
+        await client.key_on("018", "2")
+        await asyncio.sleep(1)
 
-    await asyncio.sleep(10)  # Give time for response
-    await client.key_off("002", "1")  # Example command to turn off the key
-    await asyncio.sleep(5)  # Give time for response
-    await client.key_on("002", "1")
+        # Request status of all nodes
+        print("Requesting status of all nodes...")
+        await client.status_request()
+        await asyncio.sleep(5)  # Wait for status responses - FIXED from 500 seconds
 
+        print(f"Total status events received: {len(status_events)}")
 
-    print(f"Status events received: {len(status_events)}")
-    assert len(status_events) > 0, "No status events received"
+        # If we received status events, show some details
+        if status_events:
+            print("Sample status events:")
+            for i, event in enumerate(status_events[:5]):  # Show first 5 events
+                print(f"  {i+1}. Node {event.node}, Key {event.key}: {event.status}")
+        else:
+            print("No status events received - this might indicate a connection or device issue")
 
-    client.disconnect()
+    except Exception as e:
+        print(f"Error during example execution: {e}")
+        import traceback
+        traceback.print_exc()
 
-def main():
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(example1())
-    loop.close()
+    finally:
+        print("Closing client...")
+        await client.close()
+        print("Client closed.")
 
 if __name__ == "__main__":
-    main()
-    # Run the main function to test the connection
-    #asyncio.run(try_connect())  # Uncomment this line if you want to run it
-
+    print("Running Vitrea client example...")
+    try:
+        asyncio.run(example1())
+    except KeyboardInterrupt:
+        print("Example interrupted by user")
+    except Exception as e:
+        print(f"Example failed with error: {e}")
+        import traceback
+        traceback.print_exc()

@@ -9,9 +9,8 @@ from collections import defaultdict
 
 from .constants import VitreaResponse, DeviceStatus
 
-# debug mode
+# Minimal logging setup - let the application configure logging
 import logging
-logging.basicConfig(level=logging.DEBUG)
 _LOGGER = logging.getLogger(__name__)
 
 @dataclass
@@ -149,16 +148,17 @@ class VitreaSocket:
         return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     async def connect(self, force_enable_maintenance: bool = True) -> None:
-        async with self._mutex:
-            # Only re-enable connection maintenance when explicitly requested (default True for backward compatibility)
-            # This allows internal reconnection logic to preserve the current maintenance state
-            if force_enable_maintenance:
-                self._should_maintain_connection = True
+        # Only re-enable connection maintenance when explicitly requested (default True for backward compatibility)
+        # This allows internal reconnection logic to preserve the current maintenance state
+        if force_enable_maintenance:
+            self._should_maintain_connection = True
 
-            if self._writer is not None and not self._writer.is_closing():
-                _LOGGER.debug("Already connected to Vitrea box")
-                return  # Already connected
-            await self._reconnect()
+        if self._writer is not None and not self._writer.is_closing():
+            _LOGGER.debug("Already connected to Vitrea box")
+            return  # Already connected
+
+        # Call _reconnect without holding mutex to prevent deadlock
+        await self._reconnect()
 
     async def connect_with_coordination(self, caller_context: str = "Unknown") -> bool:
         """Attempt connection with proper coordination for external callers like keepalive.
@@ -169,19 +169,18 @@ class VitreaSocket:
         Returns:
             bool: True if connection was established, False if skipped due to ongoing reconnection
         """
+        # Check if reconnection is already in progress without holding main mutex
+        if self._is_reconnecting:
+            _LOGGER.debug(f"{caller_context}: Reconnection already in progress, skipping attempt")
+            return False
+
+        # Check if already connected
+        if self._writer is not None and not self._writer.is_closing():
+            _LOGGER.debug(f"{caller_context}: Already connected, skipping attempt")
+            return False
+
         # Use main mutex to ensure coordination across all connection attempts
         async with self._mutex:
-            # Check if reconnection is already in progress with proper synchronization
-            async with self._state_mutex:
-                if self._is_reconnecting:
-                    _LOGGER.debug(f"{caller_context}: Reconnection already in progress, skipping attempt")
-                    return False
-
-            # Check if already connected
-            if self._writer is not None and not self._writer.is_closing():
-                _LOGGER.debug(f"{caller_context}: Already connected, skipping attempt")
-                return False
-
             try:
                 # Re-enable connection maintenance when connect is explicitly called
                 self._should_maintain_connection = True
@@ -194,7 +193,17 @@ class VitreaSocket:
 
     def is_connected(self) -> bool:
         """Check if the socket is connected with proper synchronization."""
-        return self._connection_state.is_set() and self._writer is not None and not self._writer.is_closing()
+        # More thorough connection check
+        if not self._connection_state.is_set():
+            return False
+        if self._writer is None or self._writer.is_closing():
+            return False
+        if self._reader is None or self._reader.at_eof():
+            return False
+        # Check if the read task is still running
+        if self._read_task is None or self._read_task.done():
+            return False
+        return True
 
     async def is_reconnecting(self) -> bool:
         """Check if reconnection is in progress with proper synchronization."""
@@ -207,73 +216,103 @@ class VitreaSocket:
             self._is_reconnecting = state
 
     async def _reconnect(self) -> None:
-        async with self._reconnect_mutex:  # Ensure that only one reconnection attempt happens at a time
-            # Check again with proper synchronization
-            async with self._state_mutex:
-                if self._is_reconnecting:
-                    _LOGGER.debug("Reconnection already in progress, skipping this attempt")
-                    return  # Another reconnection is already in progress
+        # First check if we should proceed without holding any locks
+        if not self._should_maintain_connection:
+            _LOGGER.debug("Connection maintenance disabled, skipping reconnection")
+            return
 
-                if not self._should_maintain_connection:
-                    _LOGGER.debug("Connection maintenance disabled, skipping reconnection")
+        # Check reconnection state first without acquiring mutex
+        if self._is_reconnecting:
+            _LOGGER.debug("Reconnection already in progress, skipping this attempt")
+            return
+
+        # Set reconnection state immediately to prevent race conditions
+        self._is_reconnecting = True
+
+        try:
+            self._reconnect_attempt = 0
+
+            while (self._max_reconnect_attempts is None or self._reconnect_attempt < self._max_reconnect_attempts) and self._should_maintain_connection:
+                self._reconnect_attempt += 1
+                try:
+                    _LOGGER.debug(f"Reconnection attempt {self._reconnect_attempt}")
+
+                    # Clean up any existing connection without holding mutex
+                    await self.cleanup_connection()
+
+                    # Attempt connection with timeout
+                    self._reader, self._writer = await asyncio.wait_for(
+                        asyncio.open_connection(self.host, self.port),
+                        timeout=10
+                    )
+
+                    self._socket = self._writer.get_extra_info('socket')
+                    self.sock = self._socket
+                    _LOGGER.debug(f"Connected to Vitrea box at {self.host}:{self.port}")
+                    self._connection_state.set()  # Mark as connected
+
+                    # Start read task - this must not hold mutex to prevent deadlock
+                    await self.start_read_task()
+
+                    # Enable keepalive after successful connection
+                    if self._keepalive and not self._keepalive.enabled:
+                        await self._keepalive.enable()
+                        _LOGGER.debug("Keepalive enabled for new connection")
+
+                    # Re-enable keepalive after successful reconnection
+                    if self._keepalive:
+                        await self._keepalive.resume_after_reconnection()
+
+                    self._reconnect_attempt = 0
+                    _LOGGER.info("Reconnection successful")
                     return
 
-                self._is_reconnecting = True
+                except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                    self._connection_state.clear()  # Mark as disconnected
+                    _LOGGER.warning(f"Connection attempt {self._reconnect_attempt} failed: {e}")
 
-            try:
-                self._reconnect_attempt = 0
-                while (self._max_reconnect_attempts is None or self._reconnect_attempt < self._max_reconnect_attempts) and self._should_maintain_connection:
-                    try:
-                        await self.cleanup_connection()
-                        self._reader, self._writer = await asyncio.wait_for(
-                            asyncio.open_connection(self.host, self.port),
-                            timeout=10
-                        )
-                        self._socket = self._writer.get_extra_info('socket')
-                        self.sock = self._socket
-                        _LOGGER.debug(f"Connected to Vitrea box at {self.host}:{self.port}")
-                        self._connection_state.set()  # Mark as connected
-
-                        # Restart the read task after successful reconnection
-                        await self.start_read_task()
-
-                        # Re-enable keepalive after successful reconnection with proper coordination
-                        if self._keepalive:
-                            await self._keepalive.resume_after_reconnection()
-                        self._reconnect_attempt = 0
-                        _LOGGER.info("Reconnection successful")
+                    # Check if maintenance was disabled during the attempt
+                    if not self._should_maintain_connection:
+                        _LOGGER.debug("Connection maintenance disabled during reconnection, stopping")
                         return
-                    except (asyncio.TimeoutError, ConnectionError, OSError) as e:
-                        self._reconnect_attempt += 1
-                        self._connection_state.clear()  # Mark as disconnected
 
-                        # Check if maintenance was disabled during the attempt
-                        if not self._should_maintain_connection:
-                            _LOGGER.debug("Connection maintenance disabled during reconnection, stopping")
-                            return
+                    if self._max_reconnect_attempts is not None and self._reconnect_attempt >= self._max_reconnect_attempts:
+                        _LOGGER.error(f"Failed to connect to Vitrea box after {self._max_reconnect_attempts} attempts: {e}")
+                        raise ConnectionError(f"Failed to connect to Vitrea box: {e}")
 
-                        if self._max_reconnect_attempts is not None and self._reconnect_attempt >= self._max_reconnect_attempts:
-                            _LOGGER.error(
-                                f"Failed to connect to Vitrea box after {self._max_reconnect_attempts} attempts: {e}"
-                            )
-                            raise ConnectionError(f"Failed to connect to Vitrea box: {e}")
-                        delay = ConnectionUtils.calculate_backoff_delay(self._reconnect_attempt, self._reconnect_delay)
-                        _LOGGER.warning(
-                            f"Connection attempt {self._reconnect_attempt} failed, retrying in {delay} seconds: {e}"
-                        )
-                        await asyncio.sleep(delay)
-                    except Exception as e:
-                        _LOGGER.error(f"Unexpected error connecting to Vitrea box: {e}")
-                        self._connection_state.clear()  # Mark as disconnected
-                        await self.cleanup_connection()
-                        raise
-            finally:
-                await self._set_reconnecting_state(False)  # Reset the reconnection flag with proper sync
+                    # Calculate delay and sleep between attempts
+                    delay = ConnectionUtils.calculate_backoff_delay(self._reconnect_attempt, self._reconnect_delay)
+                    _LOGGER.warning(f"Connection attempt {self._reconnect_attempt} failed, retrying in {delay} seconds: {e}")
+                    await asyncio.sleep(delay)
+
+                except Exception as e:
+                    _LOGGER.error(f"Unexpected error connecting to Vitrea box: {e}")
+                    self._connection_state.clear()  # Mark as disconnected
+                    await self.cleanup_connection()
+                    raise
+        finally:
+            # Always reset the reconnecting flag
+            self._is_reconnecting = False
 
     async def start_read_task(self) -> None:
-        if self._reader is None:
-            await self.connect()
-        if self._read_task is None or self._read_task.done():
+        # Use mutex to prevent race conditions when starting read tasks
+        async with self._mutex:
+            # Cancel any existing task first to ensure clean state
+            if self._read_task is not None and not self._read_task.done():
+                _LOGGER.debug("Cancelling existing read task before starting new one")
+                self._read_task.cancel()
+                try:
+                    await self._read_task
+                except asyncio.CancelledError:
+                    pass
+                self._read_task = None
+
+            # Log warning if no reader, but don't start task without reader
+            if self._reader is None:
+                _LOGGER.warning("Cannot start read task - no reader available")
+                return
+
+            # Create new read task
             self._read_task = asyncio.create_task(self._read_loop())
             _LOGGER.debug("Read loop task started")
 
@@ -367,22 +406,48 @@ class VitreaSocket:
     async def _read_loop(self) -> None:
         _LOGGER.debug("Starting VitreaSocket _read_loop")
 
+        # Buffer to accumulate partial messages
+        buffer = b''
+
         while self._should_maintain_connection:
             try:
+                # Wait for reader to become available if it's not set yet
+                if self._reader is None:
+                    _LOGGER.debug("Read loop waiting for connection to be established...")
+                    await asyncio.sleep(0.1)  # Brief wait before checking again
+                    continue
+
                 while self._reader is not None and not self._reader.at_eof():
-                    data = await self._reader.read(4096)
+                    try:
+                        data = await self._reader.read(4096)
+                    except asyncio.IncompleteReadError as e:
+                        # Handle partial read
+                        data = e.partial
+                        if not data:
+                            _LOGGER.debug("Incomplete read with no data, connection may be closed")
+                            raise ConnectionError("Incomplete read, connection closed")
 
                     if not data:
                         _LOGGER.debug("No data received, connection may be closed.")
                         raise ConnectionError("No data received, connection closed")
 
-                    if b'\r\n' in data:
-                        lines = data.split(b'\r\n')
-                        for line in lines:
-                            if line:
+                    # Add received data to buffer
+                    buffer += data
+
+                    # Process complete messages (ending with \r\n)
+                    while b'\r\n' in buffer:
+                        line, buffer = buffer.split(b'\r\n', 1)
+                        if line:  # Only process non-empty lines
+                            try:
                                 await self._handle_data(line)
-                    if not data.endswith(b'\r\n'):
-                        _LOGGER.debug(f"Need to handle extra data: {data}")
+                            except Exception as handle_error:
+                                _LOGGER.error(f"Error handling received data: {handle_error}")
+                                # Continue processing other messages instead of failing completely
+
+                    # Check if buffer is getting too large (prevent memory issues)
+                    if len(buffer) > 65536:  # 64KB limit
+                        _LOGGER.warning(f"Buffer size exceeded limit, clearing buffer. Lost data: {buffer[:100]}...")
+                        buffer = b''
 
                 # If we reach here, the loop ended normally (EOF)
                 _LOGGER.debug("Read loop ended normally (EOF)")
@@ -398,15 +463,70 @@ class VitreaSocket:
 
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError, ConnectionError) as e:
                 _LOGGER.warning(f"Socket error in read loop: {e}")
-                if not await self._handle_read_error("Socket error", e):
-                    break  # Exit if reconnection completely failed
+                # Clear buffer on connection error to start fresh
+                buffer = b''
+
+                # Trigger reconnection and exit this read loop
+                if self._should_maintain_connection:
+                    _LOGGER.debug("Triggering reconnection from read loop")
+                    # Schedule reconnection task without blocking this loop
+                    asyncio.create_task(self._trigger_reconnection())
+                break
 
             except Exception as e:
                 _LOGGER.error(f"Unexpected error in read loop: {e}")
-                if not await self._handle_read_error("Unexpected error", e):
-                    break  # Exit if reconnection completely failed
+                # Clear buffer on unexpected error to prevent corruption
+                buffer = b''
+
+                # Trigger reconnection and exit this read loop
+                if self._should_maintain_connection:
+                    _LOGGER.debug("Triggering reconnection from read loop due to unexpected error")
+                    # Schedule reconnection task without blocking this loop
+                    asyncio.create_task(self._trigger_reconnection())
+                break
 
         _LOGGER.debug("Read loop exited")
+
+    async def _trigger_reconnection(self):
+        """Trigger reconnection in a separate task to avoid blocking the read loop."""
+        reconnection_id = id(self)  # Unique ID for this reconnection attempt
+        _LOGGER.info(f"[{reconnection_id}] Starting triggered reconnection process...")
+
+        try:
+            await asyncio.sleep(1)  # Brief delay before reconnection
+
+            # Double-check if we should still reconnect
+            if not self._should_maintain_connection:
+                _LOGGER.debug(f"[{reconnection_id}] Connection maintenance disabled, skipping reconnection")
+                return
+
+            if self.is_connected():
+                _LOGGER.debug(f"[{reconnection_id}] Already connected, skipping reconnection")
+                return
+
+            _LOGGER.info(f"[{reconnection_id}] Executing triggered reconnection...")
+            await self._reconnect()
+            _LOGGER.info(f"[{reconnection_id}] Triggered reconnection completed successfully")
+
+        except Exception as e:
+            _LOGGER.error(f"[{reconnection_id}] Error during triggered reconnection: {e}")
+            # If reconnection fails, try multiple times with increasing delays
+            for retry in range(3):
+                if not self._should_maintain_connection or self.is_connected():
+                    break
+
+                delay = (retry + 1) * 3  # 3, 6, 9 seconds
+                _LOGGER.info(f"[{reconnection_id}] Reconnection attempt {retry + 1} failed, retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+
+                try:
+                    await self._reconnect()
+                    _LOGGER.info(f"[{reconnection_id}] Reconnection retry {retry + 1} succeeded")
+                    return
+                except Exception as retry_error:
+                    _LOGGER.warning(f"[{reconnection_id}] Reconnection retry {retry + 1} failed: {retry_error}")
+
+            _LOGGER.error(f"[{reconnection_id}] All reconnection attempts failed")
 
     async def _handle_read_error(self, error_type: str, error: Exception) -> bool:
         """Handle read loop errors with proper reconnection logic.
@@ -420,48 +540,10 @@ class VitreaSocket:
             _LOGGER.debug("Connection maintenance disabled, exiting read loop")
             return False
 
-        # Attempt reconnection with exponential backoff
-        retry_count = 0
-        max_retries = 10
-        base_delay = 1
-
-        while retry_count < max_retries and self._should_maintain_connection:
-            retry_count += 1
-            delay = ConnectionUtils.calculate_backoff_delay(retry_count, base_delay)
-            _LOGGER.debug(f"Read loop {error_type}: Attempting to reconnect in {delay} seconds (attempt {retry_count})...")
-            await asyncio.sleep(delay)
-
-            try:
-                # Only attempt reconnection if not already in progress with proper synchronization
-                if not await self.is_reconnecting():
-                    await self.cleanup_connection()
-                    # Don't force re-enable maintenance - preserve current state during internal reconnection
-                    await self.connect(force_enable_maintenance=False)
-                    _LOGGER.info(f"Read loop: Connection re-established successfully after {error_type}")
-                    return True  # Successfully reconnected, continue read loop
-                else:
-                    _LOGGER.debug("Reconnection already in progress, waiting...")
-                    await asyncio.sleep(1)  # Brief wait and try again
-                    if self.is_connected():
-                        _LOGGER.info("Read loop: Connection restored by another process")
-                        return True
-
-            except Exception as reconnect_error:
-                _LOGGER.error(f"Read loop reconnection failed (attempt {retry_count}): {reconnect_error}")
-
-                if retry_count >= max_retries:
-                    _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop after {error_type}")
-                    # Don't exit completely - wait and let outer loop try again
-                    _LOGGER.info("Read loop: Waiting before retrying reconnection cycle...")
-                    await asyncio.sleep(60)  # Wait a minute before trying again
-                    return True  # Continue outer loop to try again
-
-        # If we get here, either max retries reached or connection maintenance disabled
-        if not self._should_maintain_connection:
-            return False
-        else:
-            # Continue trying - this allows the outer loop to restart the reconnection process
-            return True
+        # Exit this read loop - let the main reconnection logic handle it
+        # This prevents multiple read loops from being created
+        _LOGGER.debug(f"Read loop exiting due to {error_type}, main connection logic will handle reconnection")
+        return False
 
     async def _handle_data(self, data: bytes) -> None:
         """Handle incoming data from socket. To be implemented by subclasses."""

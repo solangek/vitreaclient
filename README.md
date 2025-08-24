@@ -1,8 +1,10 @@
 # Vitrea
 
 Python package encapsulating the simple Vitrea box communication protocol.
-You need to identify the Vitrea box IP address and port to use this package.
-Note that the port is not necessarily the port used by the Vitrea app (hint: try +/- 1).
+You need to identify the VBox fixed IP address and port to use this package.
+The VBox usually listens to 3 ports, one of them is used by the Vitrea application,
+another is used for admin purposes, and the third one is used for communication 
+with external systems such as this package.
 
 ## Installation
 
@@ -18,7 +20,7 @@ import asyncio
 
 
 async def vitrea_test():
-    client = VitreaClient(host='192.168.1.100', port=11102)
+    client = VitreaClient(host='192.168.1.100', port=11111)
 
     status_events = []
     def on_status(event):
@@ -34,7 +36,6 @@ async def vitrea_test():
 
     # connect and start the read task to listen for incoming messages
     await client.connect()
-    await client.start_read_task()
 
     await client.key_off("018", "2")  # Example command to turn on a key
     await asyncio.sleep(2)

@@ -21,7 +21,7 @@ class VitreaClient(VitreaSocket, EventEmitter):
         self._new_switch_callback: Optional[Callable[[list], None]] = None
         self._new_cover_callback: Optional[Callable[[list], None]] = None
         self._timer_callbacks: List[Callable[[str, str, int], None]] = []
-        self._keepalive = VitreaKeepAliveHandler(self, interval_seconds=60)
+        self._keepalive = VitreaKeepAliveHandler(self, interval_seconds=19)
         #self._keepalive.set_monitor(self)
 
     async def close(self) -> None:

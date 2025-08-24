@@ -6,6 +6,8 @@ src/vitreaclient/__init__.py
 src/vitreaclient/api.py
 src/vitreaclient/client.py
 src/vitreaclient/constants.py
+src/vitreaclient/constants_backup.py
+src/vitreaclient/constants_broken.py
 src/vitreaclient.egg-info/PKG-INFO
 src/vitreaclient.egg-info/SOURCES.txt
 src/vitreaclient.egg-info/dependency_links.txt
@@ -16,3 +18,9 @@ src/vitreaclient/__pycache__/client.cpython-313.pyc
 src/vitreaclient/__pycache__/constants.cpython-313.pyc
 tests/test_connect.py
 tests/test_import.py
+tests/test_keepalive_resilience.py
+tests/test_keepalive_simple.py
+tests/test_listeners_after_reconnection.py
+tests/test_race_conditions.py
+tests/test_reconnection.py
+tests/test_should_maintain_connection.py

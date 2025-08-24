@@ -2,7 +2,7 @@
 
 import asyncio
 import socket
-from typing import Optional, Union
+from typing import Optional
 from dataclasses import dataclass
 import threading
 from collections import defaultdict
@@ -23,6 +23,64 @@ class VitreaResponseObject:
     error: str = None
     status: DeviceStatus = None
     data: dict = None
+
+
+class ConnectionUtils:
+    """Shared utilities for connection management and error handling.
+    Jitter and backoff logic adapted from:
+    https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+
+    When multiple clients experience connection failures simultaneously
+    - Without jitter, they would all retry at exactly the same times
+    - This creates traffic spikes that can overwhelm a recovering server
+    - Bidirectional jitter (±10%) spreads retries across time
+    """
+
+    @staticmethod
+    def calculate_backoff_delay(attempt: int, base_delay: int = 1, max_delay: int = 60) -> float:
+        """Calculate exponential backoff delay with jitter.
+
+        Args:
+            attempt: The attempt number (1-based)
+            base_delay: Base delay in seconds
+            max_delay: Maximum delay in seconds
+
+        Returns:
+            Delay in seconds with jitter applied
+        """
+        import random
+        delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+        # Add 10% jitter to prevent thundering herd
+        jitter = delay * 0.1
+        return delay + random.uniform(-jitter, jitter)
+
+    @staticmethod
+    def is_socket_error(exception: Exception) -> bool:
+        """Check if an exception is a socket-related error."""
+        return isinstance(exception, (ConnectionResetError, ConnectionAbortedError,
+                                    BrokenPipeError, OSError, ConnectionError))
+
+    @staticmethod
+    def log_connection_error(logger, error_type: str, attempt: int, exception: Exception, max_attempts: int = None):
+        """Standardized logging for connection errors."""
+        if max_attempts:
+            logger.warning(f"{error_type} (attempt {attempt}/{max_attempts}): {exception}")
+        else:
+            logger.warning(f"{error_type} (attempt {attempt}): {exception}")
+
+    @staticmethod
+    def log_reconnection_success(logger, context: str):
+        """Standardized logging for successful reconnections."""
+        logger.info(f"{context}: Connection re-established successfully")
+
+    @staticmethod
+    def should_continue_retrying(attempt: int, max_attempts: Optional[int], should_maintain: bool) -> bool:
+        """Determine if retrying should continue."""
+        if not should_maintain:
+            return False
+        if max_attempts is None:
+            return True
+        return attempt < max_attempts
 
 
 class EventEmitter:
@@ -76,67 +134,141 @@ class VitreaSocket:
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._keepalive: Optional[VitreaKeepAliveHandler] = None
-        #self._event_listeners: Dict[str, List[Callable]] = {}
         self._read_task: Optional[asyncio.Task] = None
         self._mutex = asyncio.Lock()
+        self._reconnect_mutex = asyncio.Lock()  # Separate mutex for reconnection
+        self._state_mutex = asyncio.Lock()  # New mutex for state synchronization
         self._reconnect_attempt = 0
         self._max_reconnect_attempts = None  # None means unlimited attempts
         self._reconnect_delay = 5  # seconds
         self._connection_state = asyncio.Event()  # To track connection state
+        self._is_reconnecting = False  # Flag to prevent multiple simultaneous reconnections
+        self._should_maintain_connection = True  # Flag to control automatic reconnection
 
     def _create_new_socket(self) -> socket.socket:
         return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    async def connect(self) -> None:
+    async def connect(self, force_enable_maintenance: bool = True) -> None:
         async with self._mutex:
+            # Only re-enable connection maintenance when explicitly requested (default True for backward compatibility)
+            # This allows internal reconnection logic to preserve the current maintenance state
+            if force_enable_maintenance:
+                self._should_maintain_connection = True
+
             if self._writer is not None and not self._writer.is_closing():
                 _LOGGER.debug("Already connected to Vitrea box")
                 return  # Already connected
             await self._reconnect()
 
+    async def connect_with_coordination(self, caller_context: str = "Unknown") -> bool:
+        """Attempt connection with proper coordination for external callers like keepalive.
+
+        Args:
+            caller_context: Context string for logging (e.g., "Keepalive", "ReadLoop")
+
+        Returns:
+            bool: True if connection was established, False if skipped due to ongoing reconnection
+        """
+        # Use main mutex to ensure coordination across all connection attempts
+        async with self._mutex:
+            # Check if reconnection is already in progress with proper synchronization
+            async with self._state_mutex:
+                if self._is_reconnecting:
+                    _LOGGER.debug(f"{caller_context}: Reconnection already in progress, skipping attempt")
+                    return False
+
+            # Check if already connected
+            if self._writer is not None and not self._writer.is_closing():
+                _LOGGER.debug(f"{caller_context}: Already connected, skipping attempt")
+                return False
+
+            try:
+                # Re-enable connection maintenance when connect is explicitly called
+                self._should_maintain_connection = True
+                await self._reconnect()
+                _LOGGER.debug(f"{caller_context}: Successfully triggered reconnection")
+                return True
+            except Exception as e:
+                _LOGGER.debug(f"{caller_context}: Connection attempt failed: {e}")
+                return False
+
     def is_connected(self) -> bool:
-        """Check if the socket is connected."""
+        """Check if the socket is connected with proper synchronization."""
         return self._connection_state.is_set() and self._writer is not None and not self._writer.is_closing()
 
+    async def is_reconnecting(self) -> bool:
+        """Check if reconnection is in progress with proper synchronization."""
+        async with self._state_mutex:
+            return self._is_reconnecting
+
+    async def _set_reconnecting_state(self, state: bool) -> None:
+        """Set reconnection state with proper synchronization."""
+        async with self._state_mutex:
+            self._is_reconnecting = state
+
     async def _reconnect(self) -> None:
-        self._reconnect_attempt = 0
-        while self._max_reconnect_attempts is None or self._reconnect_attempt < self._max_reconnect_attempts:
+        async with self._reconnect_mutex:  # Ensure that only one reconnection attempt happens at a time
+            # Check again with proper synchronization
+            async with self._state_mutex:
+                if self._is_reconnecting:
+                    _LOGGER.debug("Reconnection already in progress, skipping this attempt")
+                    return  # Another reconnection is already in progress
+
+                if not self._should_maintain_connection:
+                    _LOGGER.debug("Connection maintenance disabled, skipping reconnection")
+                    return
+
+                self._is_reconnecting = True
+
             try:
-                await self.cleanup_connection()
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
-                    timeout=10
-                )
-                self._socket = self._writer.get_extra_info('socket')
-                self.sock = self._socket
-                _LOGGER.debug(f"Connected to Vitrea box at {self.host}:{self.port}")
-                self._connection_state.set()  # Mark as connected
-
-                # Restart the read task after successful reconnection
-                await self.start_read_task()
-
-                if self._keepalive:
-                    self._keepalive.enable()
                 self._reconnect_attempt = 0
-                return
-            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
-                self._reconnect_attempt += 1
-                self._connection_state.clear()  # Mark as disconnected
-                if self._max_reconnect_attempts is not None and self._reconnect_attempt >= self._max_reconnect_attempts:
-                    _LOGGER.error(
-                        f"Failed to connect to Vitrea box after {self._max_reconnect_attempts} attempts: {e}"
-                    )
-                    raise ConnectionError(f"Failed to connect to Vitrea box: {e}")
-                delay = self._reconnect_delay * (2 ** (self._reconnect_attempt - 1))
-                _LOGGER.warning(
-                    f"Connection attempt {self._reconnect_attempt} failed, retrying in {delay} seconds: {e}"
-                )
-                await asyncio.sleep(delay)
-            except Exception as e:
-                _LOGGER.error(f"Unexpected error connecting to Vitrea box: {e}")
-                self._connection_state.clear()  # Mark as disconnected
-                await self.cleanup_connection()
-                raise
+                while (self._max_reconnect_attempts is None or self._reconnect_attempt < self._max_reconnect_attempts) and self._should_maintain_connection:
+                    try:
+                        await self.cleanup_connection()
+                        self._reader, self._writer = await asyncio.wait_for(
+                            asyncio.open_connection(self.host, self.port),
+                            timeout=10
+                        )
+                        self._socket = self._writer.get_extra_info('socket')
+                        self.sock = self._socket
+                        _LOGGER.debug(f"Connected to Vitrea box at {self.host}:{self.port}")
+                        self._connection_state.set()  # Mark as connected
+
+                        # Restart the read task after successful reconnection
+                        await self.start_read_task()
+
+                        # Re-enable keepalive after successful reconnection with proper coordination
+                        if self._keepalive:
+                            await self._keepalive.resume_after_reconnection()
+                        self._reconnect_attempt = 0
+                        _LOGGER.info("Reconnection successful")
+                        return
+                    except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                        self._reconnect_attempt += 1
+                        self._connection_state.clear()  # Mark as disconnected
+
+                        # Check if maintenance was disabled during the attempt
+                        if not self._should_maintain_connection:
+                            _LOGGER.debug("Connection maintenance disabled during reconnection, stopping")
+                            return
+
+                        if self._max_reconnect_attempts is not None and self._reconnect_attempt >= self._max_reconnect_attempts:
+                            _LOGGER.error(
+                                f"Failed to connect to Vitrea box after {self._max_reconnect_attempts} attempts: {e}"
+                            )
+                            raise ConnectionError(f"Failed to connect to Vitrea box: {e}")
+                        delay = ConnectionUtils.calculate_backoff_delay(self._reconnect_attempt, self._reconnect_delay)
+                        _LOGGER.warning(
+                            f"Connection attempt {self._reconnect_attempt} failed, retrying in {delay} seconds: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                    except Exception as e:
+                        _LOGGER.error(f"Unexpected error connecting to Vitrea box: {e}")
+                        self._connection_state.clear()  # Mark as disconnected
+                        await self.cleanup_connection()
+                        raise
+            finally:
+                await self._set_reconnecting_state(False)  # Reset the reconnection flag with proper sync
 
     async def start_read_task(self) -> None:
         if self._reader is None:
@@ -165,19 +297,32 @@ class VitreaSocket:
         self.sock = None
         self._socket = None
 
-    def disconnect(self) -> None:
-        if self._socket is not None:
-            _LOGGER.info("Forced a disconnection")
-            if self._keepalive is not None:
-                self._keepalive.pause()
-            asyncio.create_task(self.cleanup_connection())
+    async def disconnect(self) -> None:
+        """Disconnect from the Vitrea box and stop all operations."""
+        _LOGGER.info("Initiating disconnect")
+        self._should_maintain_connection = False  # Stop automatic reconnection
+
+        if self._keepalive is not None:
+            await self._keepalive.disable()  # Use async disable for consistency
+
+        await self.cleanup_connection()
+
+    async def close(self) -> None:
+        """Properly close the client and all resources."""
+        _LOGGER.info("Closing VitreaSocket")
+        self._should_maintain_connection = False
+
+        if self._keepalive is not None:
+            await self._keepalive.disable()  # Use async disable
+
+        await self.cleanup_connection()
 
     async def write(self, data: bytes) -> None:
         async with self._mutex:
             if self._writer is None or self._writer.is_closing():
                 _LOGGER.debug("Writer is None or closing, attempting to reconnect")
                 if self._keepalive is not None:
-                    self._keepalive.pause()
+                    await self._keepalive.pause()
                 try:
                     await self.connect()
                 except Exception as e:
@@ -203,10 +348,11 @@ class VitreaSocket:
                     if retry_count < max_retries:
                         _LOGGER.debug("Attempting to reconnect after write error...")
                         if self._keepalive is not None:
-                            self._keepalive.pause()
+                            await self._keepalive.pause()
                         try:
                             await self.cleanup_connection()
-                            await self.connect()
+                            # Don't force re-enable maintenance - preserve current state during write retry
+                            await self.connect(force_enable_maintenance=False)
                         except Exception as reconnect_error:
                             _LOGGER.error(f"Reconnection failed (attempt {retry_count}): {reconnect_error}")
                             if retry_count == max_retries - 1:
@@ -220,11 +366,8 @@ class VitreaSocket:
 
     async def _read_loop(self) -> None:
         _LOGGER.debug("Starting VitreaSocket _read_loop")
-        retry_count = 0
-        max_retries = 5
-        base_delay = 1
 
-        while retry_count < max_retries:
+        while self._should_maintain_connection:
             try:
                 while self._reader is not None and not self._reader.at_eof():
                     data = await self._reader.read(4096)
@@ -241,40 +384,84 @@ class VitreaSocket:
                     if not data.endswith(b'\r\n'):
                         _LOGGER.debug(f"Need to handle extra data: {data}")
 
-                # If we reach here, the loop ended normally
-                _LOGGER.debug("Read loop ended normally")
-                break
+                # If we reach here, the loop ended normally (EOF)
+                _LOGGER.debug("Read loop ended normally (EOF)")
+                if self._should_maintain_connection:
+                    _LOGGER.debug("Attempting reconnection after EOF")
+                    raise ConnectionError("Connection ended (EOF)")
+                else:
+                    break
 
             except asyncio.CancelledError:
                 _LOGGER.debug("Read loop cancelled")
                 break
+
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError, ConnectionError) as e:
-                retry_count += 1
-                _LOGGER.warning(f"Socket error in read loop (attempt {retry_count}): {e}")
-                self._connection_state.clear()  # Mark as disconnected
+                _LOGGER.warning(f"Socket error in read loop: {e}")
+                if not await self._handle_read_error("Socket error", e):
+                    break  # Exit if reconnection completely failed
 
-                if retry_count < max_retries:
-                    delay = base_delay * (2 ** (retry_count - 1))
-                    _LOGGER.debug(f"Attempting to reconnect in {delay} seconds...")
-                    await asyncio.sleep(delay)
-
-                    try:
-                        await self.cleanup_connection()
-                        await self.connect()
-                        _LOGGER.debug("Connection re-established, continuing read loop")
-                        retry_count = 0  # Reset retry count on successful reconnection
-                    except Exception as reconnect_error:
-                        _LOGGER.error(f"Reconnection failed (attempt {retry_count}): {reconnect_error}")
-                        if retry_count >= max_retries:
-                            _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop")
-                            break
-                else:
-                    _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop")
-                    break
             except Exception as e:
                 _LOGGER.error(f"Unexpected error in read loop: {e}")
-                self._connection_state.clear()
-                break
+                if not await self._handle_read_error("Unexpected error", e):
+                    break  # Exit if reconnection completely failed
+
+        _LOGGER.debug("Read loop exited")
+
+    async def _handle_read_error(self, error_type: str, error: Exception) -> bool:
+        """Handle read loop errors with proper reconnection logic.
+
+        Returns:
+            bool: True if should continue read loop, False if should exit
+        """
+        self._connection_state.clear()  # Mark as disconnected
+
+        if not self._should_maintain_connection:
+            _LOGGER.debug("Connection maintenance disabled, exiting read loop")
+            return False
+
+        # Attempt reconnection with exponential backoff
+        retry_count = 0
+        max_retries = 10
+        base_delay = 1
+
+        while retry_count < max_retries and self._should_maintain_connection:
+            retry_count += 1
+            delay = ConnectionUtils.calculate_backoff_delay(retry_count, base_delay)
+            _LOGGER.debug(f"Read loop {error_type}: Attempting to reconnect in {delay} seconds (attempt {retry_count})...")
+            await asyncio.sleep(delay)
+
+            try:
+                # Only attempt reconnection if not already in progress with proper synchronization
+                if not await self.is_reconnecting():
+                    await self.cleanup_connection()
+                    # Don't force re-enable maintenance - preserve current state during internal reconnection
+                    await self.connect(force_enable_maintenance=False)
+                    _LOGGER.info(f"Read loop: Connection re-established successfully after {error_type}")
+                    return True  # Successfully reconnected, continue read loop
+                else:
+                    _LOGGER.debug("Reconnection already in progress, waiting...")
+                    await asyncio.sleep(1)  # Brief wait and try again
+                    if self.is_connected():
+                        _LOGGER.info("Read loop: Connection restored by another process")
+                        return True
+
+            except Exception as reconnect_error:
+                _LOGGER.error(f"Read loop reconnection failed (attempt {retry_count}): {reconnect_error}")
+
+                if retry_count >= max_retries:
+                    _LOGGER.error(f"Max reconnection attempts ({max_retries}) reached in read loop after {error_type}")
+                    # Don't exit completely - wait and let outer loop try again
+                    _LOGGER.info("Read loop: Waiting before retrying reconnection cycle...")
+                    await asyncio.sleep(60)  # Wait a minute before trying again
+                    return True  # Continue outer loop to try again
+
+        # If we get here, either max retries reached or connection maintenance disabled
+        if not self._should_maintain_connection:
+            return False
+        else:
+            # Continue trying - this allows the outer loop to restart the reconnection process
+            return True
 
     async def _handle_data(self, data: bytes) -> None:
         """Handle incoming data from socket. To be implemented by subclasses."""
@@ -282,49 +469,88 @@ class VitreaSocket:
         pass
 
 class VitreaKeepAliveHandler:
-    def __init__(self, monitor = None, interval_seconds: int = 30):
-        """Initialize keepalive handler."""
+    def __init__(self, monitor = None, interval_seconds: int = 19):
+        """Initialize keepalive handler.
+
+        Args:
+            monitor: The socket monitor to send keepalives to
+            interval_seconds: Keepalive interval in seconds (default 19 to prevent connection loss)
+        """
         self.monitor = monitor
         self.interval = interval_seconds
         self.enabled = False
         self._task: Optional[asyncio.Task] = None
         self._connection_lost_count = 0
         self._max_failures = 3
+        self._task_lock = asyncio.Lock()  # Protect task management operations
+        # Removed duplicate _is_reconnecting flag - use monitor's flag instead
+        self._should_stop = False  # Clean shutdown flag
 
     def set_monitor(self, monitor):
         """Set the monitor after initialization."""
         self.monitor = monitor
 
-    def enable(self) -> None:
-        """Enable keepalive."""
-        if not self.enabled:
-            self.enabled = True
-            if self._task is None or self._task.done():
-                self._task = asyncio.create_task(self._keepalive_loop())
+    async def enable(self) -> None:
+        """Enable keepalive with proper race condition protection."""
+        async with self._task_lock:
+            if not self.enabled:
+                self.enabled = True
+                self._should_stop = False
+                await self._ensure_task_running()
 
-    def disable(self) -> None:
-        """Disable keepalive."""
+    async def disable(self) -> None:
+        """Disable keepalive with proper cleanup."""
+        async with self._task_lock:
+            if self.enabled:
+                self.enabled = False
+                self._should_stop = True
+                await self._cancel_task()
+
+    def disable_sync(self) -> None:
+        """Synchronous disable for compatibility - creates async task."""
         if self.enabled:
             self.enabled = False
-            self._cancel_task()
+            self._should_stop = True
+            # Create a task to handle the async cleanup
+            asyncio.create_task(self._async_disable_cleanup())
 
-    def reset(self) -> None:
-        """Reset keepalive timer."""
-        if self.enabled:
-            self._cancel_task()
-            self._start_task()
+    async def _async_disable_cleanup(self) -> None:
+        """Handle async cleanup for sync disable."""
+        async with self._task_lock:
+            await self._cancel_task()
 
-    def pause(self) -> None:
+    async def reset(self) -> None:
+        """Reset keepalive timer with race condition protection."""
+        async with self._task_lock:
+            if self.enabled:
+                await self._cancel_task()
+                await self._ensure_task_running()
+
+    async def pause(self) -> None:
         """Pause keepalive task without disabling."""
-        self._cancel_task()
+        async with self._task_lock:
+            await self._cancel_task()
 
-    def resume(self) -> None:
+    async def resume(self) -> None:
         """Resume paused keepalive task."""
-        if self.enabled and (not self._task or self._task.done()):
-            self._start_task()
+        async with self._task_lock:
+            if self.enabled and (not self._task or self._task.done()):
+                await self._ensure_task_running()
 
-    def _start_task(self) -> None:
-        """Start keepalive task."""
+    async def resume_after_reconnection(self) -> None:
+        """Resume keepalive after successful reconnection with proper coordination."""
+        async with self._task_lock:
+            if self.enabled:
+                # Cancel any existing task first
+                await self._cancel_task()
+                # Reset failure counter after successful reconnection
+                self._connection_lost_count = 0
+                # Start fresh keepalive task
+                await self._ensure_task_running()
+                _LOGGER.debug("Keepalive resumed after successful reconnection")
+
+    async def _ensure_task_running(self) -> None:
+        """Ensure keepalive task is running. Must be called with _task_lock held."""
         if not self._task or self._task.done():
             try:
                 # Create the task and save a reference to it
@@ -337,6 +563,10 @@ class VitreaKeepAliveHandler:
                             _LOGGER.debug("KeepAlive task was cancelled")
                         elif task.exception():
                             _LOGGER.error("KeepAlive task failed with exception: %s", task.exception())
+                            # Automatically restart task if it failed and we're still enabled
+                            if self.enabled and not self._should_stop:
+                                _LOGGER.info("Restarting failed keepalive task")
+                                asyncio.create_task(self._restart_task_after_failure())
                         else:
                             _LOGGER.debug("KeepAlive task completed normally")
                     except asyncio.CancelledError:
@@ -348,80 +578,185 @@ class VitreaKeepAliveHandler:
                 _LOGGER.exception("Error starting keepalive task: %s", e)
                 self._task = None
 
-    def _cancel_task(self) -> None:
-        """Cancel keepalive task."""
+    async def _restart_task_after_failure(self) -> None:
+        """Restart task after failure with proper locking."""
+        try:
+            async with self._task_lock:
+                if self.enabled and not self._should_stop:
+                    await asyncio.sleep(5)  # Brief delay before restart
+                    await self._ensure_task_running()
+        except Exception as e:
+            _LOGGER.error(f"Failed to restart keepalive task: {e}")
+
+    async def _cancel_task(self) -> None:
+        """Cancel keepalive task. Must be called with _task_lock held."""
         if self._task and not self._task.done():
             _LOGGER.debug("Cancelling keepalive task")
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
 
     async def _keepalive_loop(self):
-        """Keepalive loop with reconnection logic."""
+        """Keepalive loop with bulletproof connection error handling."""
         consecutive_failures = 0
+        _LOGGER.debug("Keepalive loop started")
 
-        while self.enabled:
+        while self.enabled and not self._should_stop:
             try:
+                # Check if we should continue running
+                if self._should_stop:
+                    break
+
                 if self.monitor:
-                    # Check if connection is still valid before sending keepalive
+                    # Prevent race conditions with main reconnection logic using proper async check
+                    if hasattr(self.monitor, 'is_reconnecting') and await self.monitor.is_reconnecting():
+                        _LOGGER.debug("Main reconnection in progress, keepalive waiting...")
+                        # Use shorter wait to avoid interfering with keepalive timing
+                        await asyncio.sleep(0.5)  # Brief wait instead of 2 seconds
+                        continue
+
+                    # Check connection state and attempt keepalive or reconnection
                     if not self.monitor.is_connected():
-                        _LOGGER.warning("Connection lost detected by keepalive, attempting reconnection")
-                        try:
-                            await self.monitor.connect()
-                            consecutive_failures = 0  # Reset on successful reconnection
-                        except Exception as reconnect_error:
+                        await self._handle_disconnection(consecutive_failures)
+                        consecutive_failures += 1
+                    else:
+                        # Connection appears good, try to send keepalive
+                        keepalive_success = await self._send_keepalive_safely()
+                        if keepalive_success:
+                            consecutive_failures = 0  # Reset on successful keepalive
+                            _LOGGER.debug("Keepalive sent successfully")
+                        else:
                             consecutive_failures += 1
-                            _LOGGER.error(f"Keepalive reconnection failed (attempt {consecutive_failures}): {reconnect_error}")
+                            # Handle keepalive failure with backoff to prevent tight loop
+                            if consecutive_failures <= 3:
+                                # For first few failures, try reconnection
+                                try:
+                                    success = await self.monitor.connect_with_coordination("Keepalive")
+                                    if success:
+                                        ConnectionUtils.log_reconnection_success(_LOGGER, "Keepalive")
+                                        consecutive_failures = 0  # Reset on successful reconnection
+                                except Exception as reconnect_error:
+                                    _LOGGER.debug(f"Keepalive reconnection failed: {reconnect_error}")
 
-                            if consecutive_failures >= self._max_failures:
-                                _LOGGER.error(f"Max keepalive reconnection failures ({self._max_failures}) reached, disabling keepalive.")
-                                self.enabled = False
-                                break
-
-                            # Wait before next attempt with exponential backoff
-                            backoff_delay = min(30, 2 ** consecutive_failures)
+                            # Apply backoff delay to prevent tight retry loop
+                            backoff_delay = ConnectionUtils.calculate_backoff_delay(
+                                consecutive_failures, base_delay=1, max_delay=10
+                            )
                             await asyncio.sleep(backoff_delay)
                             continue
-                    else:
-                        await self.monitor.send_keepalive()
-                        consecutive_failures = 0  # Reset on successful keepalive
 
-                await asyncio.sleep(self.interval)
+                # Use conservative jitter calculation to ensure keepalive is sent within required timeframe
+                base_interval = self.interval
+                # Limit jitter to ensure we never exceed the critical timing requirement
+                # Use negative jitter only to send keepalives earlier, not later
+                max_jitter = min(2.0, self.interval * 0.05)  # Maximum 5% jitter, capped at 2 seconds
+                import random
+                # Only subtract jitter to ensure we're always early, never late
+                actual_interval = base_interval - random.uniform(0, max_jitter)
 
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as ex:
-                consecutive_failures += 1
-                _LOGGER.warning(f"Socket error in keepalive (attempt {consecutive_failures}): {ex}")
-
-                if consecutive_failures >= self._max_failures:
-                    _LOGGER.error(f"Max keepalive failures ({self._max_failures}) reached, triggering reconnection")
-                    if self.monitor:
-                        try:
-                            await self.monitor.connect()
-                            consecutive_failures = 0
-                        except Exception as reconnect_error:
-                            _LOGGER.error(f"Keepalive triggered reconnection failed: {reconnect_error}")
-                            self.enabled = False
-                            break
-                else:
-                    # Wait before retry with exponential backoff
-                    backoff_delay = min(30, 2 ** consecutive_failures)
-                    await asyncio.sleep(backoff_delay)
+                await asyncio.sleep(actual_interval)
 
             except asyncio.CancelledError:
                 _LOGGER.debug("Keepalive loop cancelled")
                 break
+
             except Exception as ex:
                 consecutive_failures += 1
-                _LOGGER.error(f"Unexpected keepalive error (attempt {consecutive_failures}): {ex}")
 
-                if consecutive_failures >= self._max_failures:
-                    _LOGGER.error(f"Max keepalive failures ({self._max_failures}) reached, disabling keepalive.")
-                    self.enabled = False
-                    break
+                # Use shared utilities for error handling
+                if ConnectionUtils.is_socket_error(ex):
+                    ConnectionUtils.log_connection_error(_LOGGER, "Socket error in keepalive", consecutive_failures, ex)
+                    await self._handle_socket_error(consecutive_failures)
+                else:
+                    _LOGGER.error(f"Unexpected keepalive error (attempt {consecutive_failures}): {ex}")
+                    # Use ConnectionUtils for backoff calculation
+                    backoff_delay = ConnectionUtils.calculate_backoff_delay(consecutive_failures, base_delay=2, max_delay=30)
+                    await asyncio.sleep(backoff_delay)
 
-                # Wait before retry
-                await asyncio.sleep(min(30, 2 ** consecutive_failures))
+        _LOGGER.debug("Keepalive loop exited")
+
+    async def _send_keepalive_safely(self) -> bool:
+        """Send keepalive with proper error isolation.
+
+        Returns:
+            bool: True if keepalive was sent successfully, False otherwise
+        """
+        try:
+            await self.monitor.send_keepalive()
+            return True
+        except Exception as e:
+            # Use shared utility for error classification
+            if ConnectionUtils.is_socket_error(e):
+                _LOGGER.debug(f"Socket error during keepalive send: {e}")
+            else:
+                _LOGGER.warning(f"Keepalive send failed with unexpected error: {e}")
+
+            # Mark connection as potentially lost
+            if hasattr(self.monitor, '_connection_state'):
+                self.monitor._connection_state.clear()
+            return False
+
+    async def _handle_disconnection(self, consecutive_failures: int) -> None:
+        """Handle detected disconnection with proper coordination."""
+        _LOGGER.warning(f"Connection lost detected by keepalive (failure #{consecutive_failures + 1})")
+
+        # Avoid interfering with main reconnection logic using proper async check
+        if hasattr(self.monitor, 'is_reconnecting') and await self.monitor.is_reconnecting():
+            _LOGGER.debug("Main reconnection already in progress, keepalive backing off")
+            backoff_delay = ConnectionUtils.calculate_backoff_delay(consecutive_failures, base_delay=5, max_delay=30)
+            await asyncio.sleep(backoff_delay)
+            return
+
+        # Attempt coordinated reconnection
+        try:
+            success = await self.monitor.connect_with_coordination("Keepalive")
+            if success:
+                ConnectionUtils.log_reconnection_success(_LOGGER, "Keepalive")
+            else:
+                _LOGGER.debug("Keepalive reconnection skipped - handled by main logic")
+        except Exception as reconnect_error:
+            _LOGGER.debug(f"Keepalive reconnection failed: {reconnect_error}")
+            # Don't log as error since main reconnection logic will handle it
+
+            # Use shared utility for backoff calculation
+            backoff_delay = ConnectionUtils.calculate_backoff_delay(consecutive_failures, base_delay=5)
+            _LOGGER.debug(f"Keepalive backing off for {backoff_delay:.1f} seconds")
+            await asyncio.sleep(backoff_delay)
+
+    async def _handle_socket_error(self, consecutive_failures: int) -> None:
+        """Handle socket errors during keepalive operations."""
+        # Mark connection as lost
+        if hasattr(self.monitor, '_connection_state'):
+            self.monitor._connection_state.clear()
+
+        # Don't immediately try to reconnect if main logic is already handling it using proper async check
+        if hasattr(self.monitor, 'is_reconnecting') and await self.monitor.is_reconnecting():
+            _LOGGER.debug("Main reconnection handling socket error, keepalive waiting")
+            await asyncio.sleep(10)
+            return
+
+        # Try to recover from socket error with coordination
+        if self.monitor:
+            try:
+                success = await self.monitor.connect_with_coordination("Keepalive")
+                if success:
+                    ConnectionUtils.log_reconnection_success(_LOGGER, "Keepalive")
+            except Exception as reconnect_error:
+                _LOGGER.debug(f"Keepalive socket error recovery failed: {reconnect_error}")
+
+        # Use shared utility for backoff calculation
+        backoff_delay = ConnectionUtils.calculate_backoff_delay(consecutive_failures, base_delay=5)
+        await asyncio.sleep(backoff_delay)
 
     def restart(self):
-        """Restart the keepalive handler."""
+        """Restart the keepalive handler (legacy sync method)."""
         _LOGGER.debug("Restarting keepalive handler")
-        self.disable()
-        self.enable()
+        asyncio.create_task(self._restart_async())
+
+    async def _restart_async(self):
+        """Async restart implementation."""
+        await self.disable()
+        await self.enable()
